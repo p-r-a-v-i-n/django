@@ -27,12 +27,8 @@ class TemplateDoesNotExist(Exception):
 
     def __init__(self, msg, tried=None, backend=None, chain=None):
         self.backend = backend
-        if tried is None:
-            tried = []
-        self.tried = tried
-        if chain is None:
-            chain = []
-        self.chain = chain
+        self.tried   = tried if tried else []
+        self.chain   = chain if chain else []
         super().__init__(msg)
 
 
