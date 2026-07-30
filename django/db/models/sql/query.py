@@ -1523,8 +1523,15 @@ class Query(BaseExpression):
                 lookup_splitted, self.annotations
             )
             if annotation:
+                annotation_expression = self.annotations[annotation]
+                if getattr(annotation_expression, "set_returning", False):
+                    expression = self._setup_set_returning_function_join(
+                        annotation_expression,
+                        annotation,
+                    )
+                    return expression_lookups, (), expression
                 table_subquery = self._get_multi_column_query(
-                    self.annotations[annotation]
+                    annotation_expression
                 )
                 if table_subquery is not None:
                     expression, expression_lookups = self._resolve_inner_subquery_path(
@@ -1532,7 +1539,7 @@ class Query(BaseExpression):
                         lookup_splitted,
                     )
                     return expression_lookups, (), expression
-                expression = self.annotations[annotation]
+                expression = annotation_expression
                 if summarize:
                     expression = Ref(annotation, expression)
                 return expression_lookups, (), expression
