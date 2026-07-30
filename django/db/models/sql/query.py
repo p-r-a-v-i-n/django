@@ -47,6 +47,7 @@ from django.db.models.sql.datastructures import (
     Empty,
     Join,
     MultiJoin,
+    SetReturningFunctionJoin,
     SubqueryJoin,
 )
 from django.db.models.sql.where import AND, OR, ExtraWhere, NothingNode, WhereNode
@@ -1367,6 +1368,18 @@ class Query(BaseExpression):
         table_alias = self.join(join)
         return self.alias_map[table_alias]
 
+    def _setup_set_returning_function_join(self, annotation, alias):
+        self.get_initial_alias()
+        table_alias, _ = self.table_alias(alias, create=True)
+        join = SetReturningFunctionJoin(
+            annotation,
+            alias,
+            table_alias,
+        )
+        self.alias_map[table_alias] = join
+        field = join.get_field(alias)
+        return Col(join.table_alias, field)
+
     def _resolve_inner_subquery_path(self, table_subquery, parts):
         """Resolve a table-source output and return the unused path parts."""
         output_names = {name for name, _ in table_subquery._get_output_expressions()}
@@ -2258,6 +2271,8 @@ class Query(BaseExpression):
     def resolve_ref(self, name, allow_joins=True, reuse=None, summarize=False):
         annotation = self.annotations.get(name)
         if annotation is not None:
+            if getattr(annotation, "set_returning", False):
+                return self._setup_set_returning_function_join(annotation, name)
             table_subquery = self._get_multi_column_query(annotation)
             is_multi_column_query = table_subquery is not None
             if not allow_joins and is_multi_column_query:
