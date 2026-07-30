@@ -1380,6 +1380,7 @@ class Query(BaseExpression):
                 for join in self.alias_map.values()
                 if isinstance(join, SetReturningFunctionJoin)
                 and join.table_name == alias
+                and join.srf_func == annotation
             ),
             None,
         )
