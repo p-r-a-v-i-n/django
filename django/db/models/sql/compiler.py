@@ -458,7 +458,7 @@ class SQLCompiler:
                     and ref not in self.query.annotation_select
                 )
                 is_table_source = (
-                    getattr(expr, "set_returning", False)
+                    getattr(expr, "table_source", False)
                     and ref not in self.query.annotation_select
                 )
                 if (

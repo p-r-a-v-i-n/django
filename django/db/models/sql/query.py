@@ -1454,6 +1454,12 @@ class Query(BaseExpression):
         else:
             self.set_annotation_mask(set(self.annotation_select).difference({alias}))
         self.annotations[alias] = annotation
+        if select and getattr(annotation, "table_source", False):
+            expression, _ = self._resolve_set_returning_function_path(
+                annotation,
+                [alias],
+            )
+            self.annotations[alias] = expression
         if select and self.selected:
             self.selected[alias] = alias
 
@@ -1564,7 +1570,7 @@ class Query(BaseExpression):
             )
             if annotation:
                 annotation_expression = self.annotations[annotation]
-                if getattr(annotation_expression, "set_returning", False):
+                if getattr(annotation_expression, "table_source", False):
                     expression, expression_lookups = (
                         self._resolve_set_returning_function_path(
                             annotation_expression,
@@ -2320,7 +2326,7 @@ class Query(BaseExpression):
     def resolve_ref(self, name, allow_joins=True, reuse=None, summarize=False):
         annotation = self.annotations.get(name)
         if annotation is not None:
-            if getattr(annotation, "set_returning", False):
+            if getattr(annotation, "table_source", False):
                 expression, _ = self._resolve_set_returning_function_path(
                     annotation,
                     [name],
@@ -2358,7 +2364,7 @@ class Query(BaseExpression):
         else:
             field_list = name.split(LOOKUP_SEP)
             annotation = self.annotations.get(field_list[0])
-            if getattr(annotation, "set_returning", False):
+            if getattr(annotation, "table_source", False):
                 expression, transforms = self._resolve_set_returning_function_path(
                     annotation,
                     field_list,
@@ -2640,6 +2646,10 @@ class Query(BaseExpression):
                         self.annotations.get(item.split(LOOKUP_SEP, 1)[0])
                     )
                     is not None
+                ) or getattr(
+                    self.annotations.get(item.split(LOOKUP_SEP, 1)[0]),
+                    "table_source",
+                    False,
                 ):
                     continue
                 if self.extra and item in self.extra:
