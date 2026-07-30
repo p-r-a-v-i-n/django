@@ -1368,7 +1368,12 @@ class Query(BaseExpression):
         table_alias = self.join(join)
         return self.alias_map[table_alias]
 
-    def _setup_set_returning_function_join(self, annotation, alias):
+    def _setup_set_returning_function_join(
+        self,
+        annotation,
+        alias,
+        field_name=None,
+    ):
         existing = next(
             (
                 join
@@ -1380,7 +1385,7 @@ class Query(BaseExpression):
         )
         if existing is not None:
             self.ref_alias(existing.table_alias)
-            field = existing.get_field(alias)
+            field = existing.get_field(field_name or alias)
             return Col(existing.table_alias, field)
         self.get_initial_alias()
         table_alias, _ = self.table_alias(alias, create=True)
@@ -1390,8 +1395,30 @@ class Query(BaseExpression):
             table_alias,
         )
         self.alias_map[table_alias] = join
-        field = join.get_field(alias)
+        field = join.get_field(field_name or alias)
         return Col(join.table_alias, field)
+
+    def _resolve_set_returning_function_path(self, annotation, parts):
+        field_path = None
+        resolved_idx = 1
+        output_field = annotation.output_field
+        if getattr(output_field, "is_composite", False):
+            for idx in range(len(parts), 1, -1):
+                candidate = LOOKUP_SEP.join(parts[1:idx])
+                try:
+                    output_field.get_field(candidate)
+                except FieldError:
+                    continue
+                field_path = candidate
+                resolved_idx = idx
+                break
+
+        expression = self._setup_set_returning_function_join(
+            annotation,
+            parts[0],
+            field_path,
+        )
+        return expression, parts[resolved_idx:]
 
     def _resolve_inner_subquery_path(self, table_subquery, parts):
         """Resolve a table-source output and return the unused path parts."""
@@ -1538,9 +1565,11 @@ class Query(BaseExpression):
             if annotation:
                 annotation_expression = self.annotations[annotation]
                 if getattr(annotation_expression, "set_returning", False):
-                    expression = self._setup_set_returning_function_join(
-                        annotation_expression,
-                        annotation,
+                    expression, expression_lookups = (
+                        self._resolve_set_returning_function_path(
+                            annotation_expression,
+                            lookup_splitted,
+                        )
                     )
                     return expression_lookups, (), expression
                 table_subquery = self._get_multi_column_query(
@@ -2292,7 +2321,11 @@ class Query(BaseExpression):
         annotation = self.annotations.get(name)
         if annotation is not None:
             if getattr(annotation, "set_returning", False):
-                return self._setup_set_returning_function_join(annotation, name)
+                expression, _ = self._resolve_set_returning_function_path(
+                    annotation,
+                    [name],
+                )
+                return expression
             table_subquery = self._get_multi_column_query(annotation)
             is_multi_column_query = table_subquery is not None
             if not allow_joins and is_multi_column_query:
@@ -2325,6 +2358,14 @@ class Query(BaseExpression):
         else:
             field_list = name.split(LOOKUP_SEP)
             annotation = self.annotations.get(field_list[0])
+            if getattr(annotation, "set_returning", False):
+                expression, transforms = self._resolve_set_returning_function_path(
+                    annotation,
+                    field_list,
+                )
+                for transform in transforms:
+                    expression = self.try_transform(expression, transform)
+                return expression
             table_subquery = self._get_multi_column_query(annotation)
             is_multi_column_query = table_subquery is not None
             if not allow_joins and is_multi_column_query:
