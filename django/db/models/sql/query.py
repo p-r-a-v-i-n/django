@@ -1506,6 +1506,8 @@ class Query(BaseExpression):
                 [alias],
             )
             self.annotations[alias] = expression
+        if select:
+            self.demote_joins(self._gen_table_source_aliases([self.annotations[alias]]))
         if select and self.selected:
             self.selected[alias] = alias
 
