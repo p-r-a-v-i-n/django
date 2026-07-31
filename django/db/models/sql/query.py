@@ -2328,21 +2328,22 @@ class Query(BaseExpression):
     def resolve_ref(self, name, allow_joins=True, reuse=None, summarize=False):
         annotation = self.annotations.get(name)
         if annotation is not None:
-            if getattr(annotation, "table_source", False):
+            is_table_source = getattr(annotation, "table_source", False)
+            table_subquery = self._get_multi_column_query(annotation)
+            is_multi_column_query = table_subquery is not None
+            if not allow_joins and (is_table_source or is_multi_column_query):
+                raise FieldError(
+                    "Joined field references are not permitted in this query"
+                )
+            if is_table_source:
                 expression, _ = self._resolve_set_returning_function_path(
                     annotation,
                     [name],
                 )
                 return expression
-            table_subquery = self._get_multi_column_query(annotation)
-            is_multi_column_query = table_subquery is not None
-            if not allow_joins and is_multi_column_query:
-                raise FieldError(
-                    "Joined field references are not permitted in this query"
-                )
             if not allow_joins:
                 for alias in self._gen_col_aliases([annotation]):
-                    if isinstance(self.alias_map[alias], Join):
+                    if self.alias_map[alias].join_type is not None:
                         raise FieldError(
                             "Joined field references are not permitted in this query"
                         )
@@ -2366,7 +2367,14 @@ class Query(BaseExpression):
         else:
             field_list = name.split(LOOKUP_SEP)
             annotation = self.annotations.get(field_list[0])
-            if getattr(annotation, "table_source", False):
+            is_table_source = getattr(annotation, "table_source", False)
+            table_subquery = self._get_multi_column_query(annotation)
+            is_multi_column_query = table_subquery is not None
+            if not allow_joins and (is_table_source or is_multi_column_query):
+                raise FieldError(
+                    "Joined field references are not permitted in this query"
+                )
+            if is_table_source:
                 expression, transforms = self._resolve_set_returning_function_path(
                     annotation,
                     field_list,
@@ -2374,12 +2382,6 @@ class Query(BaseExpression):
                 for transform in transforms:
                     expression = self.try_transform(expression, transform)
                 return expression
-            table_subquery = self._get_multi_column_query(annotation)
-            is_multi_column_query = table_subquery is not None
-            if not allow_joins and is_multi_column_query:
-                raise FieldError(
-                    "Joined field references are not permitted in this query"
-                )
             if is_multi_column_query:
                 expression, transforms = self._resolve_inner_subquery_path(
                     table_subquery,
