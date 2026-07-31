@@ -3061,6 +3061,8 @@ class Query(BaseExpression):
         self.values_select = tuple(field_names)
         self.add_fields(field_names, True)
         self.selected = selected if fields else None
+        if self.selected:
+            self.demote_joins(self._gen_table_source_aliases(self.selected.values()))
 
     @property
     def annotation_select(self):
