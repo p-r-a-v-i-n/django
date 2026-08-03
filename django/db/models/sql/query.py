@@ -1385,37 +1385,14 @@ class Query(BaseExpression):
         alias,
         field_name=None,
     ):
-        existing = next(
-            (
-                join
-                for join in self.alias_map.values()
-                if isinstance(join, SetReturningFunctionJoin)
-                and join.table_name == alias
-                and join.srf_func == annotation
-            ),
-            None,
-        )
-        if existing is not None:
-            self.ref_alias(existing.table_alias)
-            if field_name is None and getattr(
-                annotation.output_field,
-                "is_composite",
-                False,
-            ):
-                return self._resolve_table_source_tuple(
-                    existing,
-                    annotation.output_field,
-                )
-            field = existing.get_field(field_name or alias)
-            return Col(existing.table_alias, field)
         self.get_initial_alias()
-        table_alias, _ = self.table_alias(alias, create=True)
         join = SetReturningFunctionJoin(
             annotation,
             alias,
-            table_alias,
+            None,
         )
-        self.alias_map[table_alias] = join
+        table_alias = self.join(join)
+        join = self.alias_map[table_alias]
         if field_name is None and getattr(
             annotation.output_field,
             "is_composite",
