@@ -1461,6 +1461,15 @@ class Query(BaseExpression):
                     f"Multi-column subquery alias {alias!r} cannot contain the lookup "
                     f"separator {LOOKUP_SEP!r}."
                 )
+        if (
+            select
+            and getattr(annotation, "table_source", False)
+            and getattr(annotation.output_field, "is_composite", False)
+        ):
+            raise NotImplementedError(
+                "Selecting a multi-column table source as an annotation is not "
+                "supported."
+            )
         if select:
             self.append_annotation_mask([alias])
         else:
@@ -1480,15 +1489,6 @@ class Query(BaseExpression):
                     and table_alias not in required_table_sources
                 ):
                     self.unref_alias(table_alias)
-        if (
-            select
-            and getattr(annotation, "table_source", False)
-            and getattr(annotation.output_field, "is_composite", False)
-        ):
-            raise NotImplementedError(
-                "Selecting a multi-column table source as an annotation is not "
-                "supported."
-            )
         if select and getattr(annotation, "table_source", False):
             expression, _ = self._resolve_set_returning_function_path(
                 annotation,
