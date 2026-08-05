@@ -1,4 +1,3 @@
-from django.contrib.postgres.fields import ArrayField
 from django.core.exceptions import FieldError
 from django.db import connection
 from django.db.models import (
@@ -180,6 +179,8 @@ class CompositeSetReturningFunctionExecutionTests(PostgreSQLTestCase):
         self.assertSequenceEqual(list(results), [("first", "size", "large")])
 
     def test_nested_composite_columns(self):
+        from django.contrib.postgres.fields import ArrayField
+
         results = (
             AggregateTestModel.objects.filter(char_field="first")
             .alias(
@@ -346,9 +347,11 @@ class CorrelatedSetReturningFunctionExecutionTests(PostgreSQLTestCase):
         )
 
     def test_aggregate_over_function_column(self):
-        result = AggregateTestModel.objects.alias(
-            number=GenerateSeries(1, "integer_field")
-        ).aggregate(total=Count("number"))
+        result = (
+            AggregateTestModel.objects.alias(number=GenerateSeries(1, "integer_field"))
+            .annotate(number=F("number"))
+            .aggregate(total=Count("number"))
+        )
 
         self.assertEqual(result, {"total": 5})
 
@@ -359,7 +362,9 @@ class CorrelatedSetReturningFunctionExecutionTests(PostgreSQLTestCase):
         )
 
         with CaptureQueriesContext(connection) as captured_queries:
-            result = queryset.aggregate(total=Count("number"))
+            result = queryset.annotate(number=F("number")).aggregate(
+                total=Count("number")
+            )
 
         self.assertIn("CROSS JOIN LATERAL", captured_queries[0]["sql"])
         self.assertNotIn("LEFT OUTER JOIN LATERAL", captured_queries[0]["sql"])

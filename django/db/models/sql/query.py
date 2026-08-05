@@ -2409,12 +2409,6 @@ class Query(BaseExpression):
                 raise FieldError(
                     "Joined field references are not permitted in this query"
                 )
-            if is_table_source:
-                expression, _ = self._resolve_set_returning_function_path(
-                    annotation,
-                    [name],
-                )
-                return expression
             if not allow_joins:
                 for alias in self._gen_col_aliases([annotation]):
                     if self.alias_map[alias].join_type is not None:
@@ -2434,6 +2428,12 @@ class Query(BaseExpression):
                     )
                 return Ref(name, self.annotation_select[name])
             else:
+                if is_table_source:
+                    expression, _ = self._resolve_set_returning_function_path(
+                        annotation,
+                        [name],
+                    )
+                    return expression
                 if is_multi_column_query:
                     join = self._setup_inner_subquery_join(table_subquery, name)
                     return self._resolve_inner_subquery_tuple(join)

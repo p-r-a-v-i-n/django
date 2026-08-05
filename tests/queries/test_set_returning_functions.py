@@ -159,7 +159,9 @@ class SetReturningFunctionOuterJoinMixin:
         ).filter(Q(pk=self.empty.pk) | Q(element="not-present"))
 
         with CaptureQueriesContext(connection) as captured_queries:
-            result = queryset.aggregate(total=Count("element"))
+            result = queryset.annotate(element=F("element")).aggregate(
+                total=Count("element")
+            )
         sql = captured_queries[0]["sql"]
 
         self.assertIn("CROSS JOIN", sql)
