@@ -169,6 +169,46 @@ class SetReturningFunctionOuterJoinMixin:
         self.assertNotIn("LATERAL", sql)
         self.assertEqual(result, {"total": 0})
 
+    def test_reassigned_masked_annotation_discards_table_source(self):
+        results = (
+            JSONFieldNullable.objects.filter(pk=self.empty.pk)
+            .annotate(
+                element=self.table_source_class(
+                    Value(["first", "second"], output_field=JSONField())
+                )
+            )
+            .values("pk")
+            .alias(element=Value("replacement"))
+            .values_list("pk", flat=True)
+        )
+        sql, _ = results.query.sql_with_params()
+
+        self.assertNotIn("CROSS JOIN", sql)
+        self.assertNotIn("LEFT OUTER JOIN", sql)
+        self.assertSequenceEqual(list(results), [self.empty.pk])
+
+    def test_reassigned_shared_annotations_discard_table_source(self):
+        results = (
+            JSONFieldNullable.objects.filter(pk=self.empty.pk)
+            .alias(
+                element=self.table_source_class(
+                    Value(["first", "second"], output_field=JSONField())
+                )
+            )
+            .annotate(first=F("element"), second=F("element"))
+            .annotate(first=Value("first"))
+            .annotate(second=Value("second"))
+            .values_list("pk", "first", "second")
+        )
+        sql, _ = results.query.sql_with_params()
+
+        self.assertNotIn("CROSS JOIN", sql)
+        self.assertNotIn("LEFT OUTER JOIN", sql)
+        self.assertSequenceEqual(
+            list(results),
+            [(self.empty.pk, "first", "second")],
+        )
+
     def test_negated_table_source_filter(self):
         results = (
             JSONFieldNullable.objects.filter(pk=self.empty.pk)

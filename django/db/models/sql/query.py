@@ -1447,7 +1447,6 @@ class Query(BaseExpression):
         """Add a single annotation expression to the Query."""
         self.check_alias(alias)
         previous_annotation = self.annotations.get(alias)
-        previously_selected = alias in self.annotation_select
         annotation = annotation.resolve_expression(self, allow_joins=True, reuse=None)
         table_subquery = self._get_multi_column_query(annotation)
         if LOOKUP_SEP in alias:
@@ -1475,20 +1474,8 @@ class Query(BaseExpression):
         else:
             self.set_annotation_mask(set(self.annotation_select).difference({alias}))
         self.annotations[alias] = annotation
-        if previously_selected:
-            required_table_sources = set(self._gen_required_table_source_aliases())
-            previous_table_sources = set(
-                self._gen_table_source_aliases([previous_annotation])
-            )
-            for table_alias in previous_table_sources:
-                if (
-                    isinstance(
-                        self.alias_map.get(table_alias),
-                        SetReturningFunctionJoin,
-                    )
-                    and table_alias not in required_table_sources
-                ):
-                    self.unref_alias(table_alias)
+        if previous_annotation is not None:
+            self._release_table_sources([previous_annotation])
         if select and getattr(annotation, "table_source", False):
             expression, _ = self._resolve_set_returning_function_path(
                 annotation,
@@ -2372,8 +2359,18 @@ class Query(BaseExpression):
     def _gen_col_aliases(cls, exprs):
         yield from (expr.alias for expr in cls._gen_cols(exprs))
 
+    def _gen_direct_table_source_aliases(self, expressions):
+        """Yield table sources used directly by the given expressions."""
+        for alias in self._gen_col_aliases(expressions):
+            if isinstance(self.alias_map.get(alias), SetReturningFunctionJoin):
+                yield alias
+
     def _gen_table_source_aliases(self, exprs):
-        aliases = list(self._gen_col_aliases(exprs))
+        """
+        Yield all table sources used by the given expressions. Also include
+        earlier table sources used by another table source.
+        """
+        aliases = list(self._gen_direct_table_source_aliases(exprs))
         seen = set()
 
         while aliases:
@@ -2382,20 +2379,39 @@ class Query(BaseExpression):
                 continue
             seen.add(alias)
             join = self.alias_map.get(alias)
-            if not isinstance(join, SetReturningFunctionJoin):
-                continue
             yield alias
             # This function might use the column of an earlier table source.
-            aliases.extend(self._gen_col_aliases([join.srf_func]))
+            aliases.extend(self._gen_direct_table_source_aliases([join.srf_func]))
 
     def _require_table_sources(self, expressions):
         """
-        Make table sources referenced by expressions, including indirect
-        dependencies, required.
+        Make table sources used by the expressions use an inner join. Also
+        include earlier table sources used by another table source.
         """
         self.demote_joins(self._gen_table_source_aliases(expressions))
 
+    def _release_table_sources(self, expressions):
+        """
+        Release table sources used directly by the given expressions. Keep a
+        source if the query still uses it. When a source becomes unused, also
+        release the earlier table sources that it uses.
+        """
+        referenced_table_sources = set(self._gen_required_table_source_aliases())
+        aliases = list(self._gen_direct_table_source_aliases(expressions))
+        while aliases:
+            alias = aliases.pop()
+            if self.alias_refcount[alias] == 1 and alias in referenced_table_sources:
+                continue
+            self.unref_alias(alias)
+            if self.alias_refcount[alias] == 0:
+                join = self.alias_map[alias]
+                aliases.extend(self._gen_direct_table_source_aliases([join.srf_func]))
+
     def _gen_required_table_source_aliases(self):
+        """
+        Yield table sources that must remain available to the query. Check
+        filters, selected expressions, annotations, and grouping.
+        """
         expressions = chain(
             (self.where,),
             self.annotation_select.values(),

@@ -402,6 +402,34 @@ class MultipleSetReturningFunctionExecutionTests(PostgreSQLTestCase):
         self.assertNotIn("generate_series", sql)
         self.assertSequenceEqual(list(results), [7])
 
+    def test_reassigned_shared_aliases_discard_function_dependencies(self):
+        AggregateTestModel.objects.create()
+        queryset = (
+            AggregateTestModel.objects.alias(
+                upper_bound=GenerateSeries(1, 2),
+                number=GenerateSeries(1, F("upper_bound")),
+            )
+            .annotate(first=F("number"), second=F("number"))
+            .annotate(first=Value(7))
+        )
+
+        partially_reassigned = queryset.order_by("second").values_list(
+            "first", "second"
+        )
+        sql, _ = partially_reassigned.query.sql_with_params()
+        self.assertEqual(sql.count("generate_series"), 2)
+        self.assertSequenceEqual(
+            list(partially_reassigned),
+            [(7, 1), (7, 1), (7, 2)],
+        )
+
+        fully_reassigned = queryset.annotate(second=Value(8)).values_list(
+            "first", "second"
+        )
+        sql, _ = fully_reassigned.query.sql_with_params()
+        self.assertNotIn("generate_series", sql)
+        self.assertSequenceEqual(list(fully_reassigned), [(7, 8)])
+
     def test_or_promotes_dependent_function_chain(self):
         AggregateTestModel.objects.bulk_create(
             [
@@ -1054,6 +1082,37 @@ class SetReturningFunctionExecutionTests(PostgreSQLTestCase):
 
         self.assertEqual(sql.count("generate_series"), 2)
         self.assertSequenceEqual(list(results), [7, 8])
+
+    def test_reassigned_masked_annotation_discards_table_source(self):
+        obj = AggregateTestModel.objects.create()
+
+        results = (
+            AggregateTestModel.objects.annotate(number=GenerateSeries(1, 2))
+            .values("pk")
+            .alias(number=Value(7))
+            .values_list("pk", flat=True)
+        )
+        sql, _ = results.query.sql_with_params()
+
+        self.assertNotIn("generate_series", sql)
+        self.assertNotIn("CROSS JOIN LATERAL", sql)
+        self.assertSequenceEqual(list(results), [obj.pk])
+
+    def test_reassigned_shared_annotations_discard_table_source(self):
+        obj = AggregateTestModel.objects.create()
+
+        results = (
+            AggregateTestModel.objects.alias(number=GenerateSeries(1, 2))
+            .annotate(first=F("number"), second=F("number"))
+            .annotate(first=Value(1))
+            .annotate(second=Value(2))
+            .values_list("pk", "first", "second")
+        )
+        sql, _ = results.query.sql_with_params()
+
+        self.assertNotIn("generate_series", sql)
+        self.assertNotIn("CROSS JOIN LATERAL", sql)
+        self.assertSequenceEqual(list(results), [(obj.pk, 1, 2)])
 
     def test_scalar_function_ordering(self):
         AggregateTestModel.objects.create()
