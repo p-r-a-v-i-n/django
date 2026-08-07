@@ -30,6 +30,7 @@ from django.db.models.sql.constants import (
     ROW_COUNT,
     SINGLE,
 )
+from django.db.models.sql.datastructures import SetReturningFunctionJoin
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
 from django.utils.deprecation import RemovedInDjango70Warning
@@ -824,6 +825,11 @@ class SQLCompiler:
         in the query.
         """
         refcounts_before = self.query.alias_refcount.copy()
+        table_source_joins_before = {
+            alias: join
+            for alias, join in self.query.alias_map.items()
+            if isinstance(join, SetReturningFunctionJoin)
+        }
         try:
             combinator = self.query.combinator
             extra_select, order_by, group_by = self.pre_sql_setup(
@@ -1039,7 +1045,8 @@ class SQLCompiler:
 
             return " ".join(result), tuple(params)
         finally:
-            # Finally do cleanup - get rid of the joins we created above.
+            # Restore table source joins and remove joins created above.
+            self.query.alias_map.update(table_source_joins_before)
             self.query.reset_refcounts(refcounts_before)
 
     def get_default_columns(

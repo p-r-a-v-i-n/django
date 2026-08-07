@@ -909,6 +909,25 @@ class SetReturningFunctionExecutionTests(PostgreSQLTestCase):
         self.assertNotIn("CROSS JOIN LATERAL", sql)
         self.assertSequenceEqual(list(results), ["keep"])
 
+    def test_compiled_ordering_then_replaced_keeps_table_source_optional(self):
+        obj = AggregateTestModel.objects.create()
+        queryset = (
+            AggregateTestModel.objects.alias(number=GenerateSeries(1, 0))
+            .filter(Q(pk=obj.pk) | Q(number=1))
+            .order_by("number")
+        )
+        sql, _ = queryset.query.sql_with_params()
+
+        self.assertIn("CROSS JOIN LATERAL", sql)
+        self.assertNotIn("LEFT OUTER JOIN LATERAL", sql)
+
+        results = queryset.order_by("pk").values_list("pk", flat=True)
+        sql, _ = results.query.sql_with_params()
+
+        self.assertIn("LEFT OUTER JOIN LATERAL", sql)
+        self.assertNotIn("CROSS JOIN LATERAL", sql)
+        self.assertSequenceEqual(list(results), [obj.pk])
+
     def test_q_or_keeps_previously_filtered_table_source_required(self):
         AggregateTestModel.objects.create(char_field="keep")
 

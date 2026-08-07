@@ -153,6 +153,27 @@ class SetReturningFunctionOuterJoinMixin:
         self.assertNotIn("LATERAL", sql)
         self.assertSequenceEqual(list(results), [])
 
+    def test_compiled_ordering_then_replaced_keeps_table_source_optional(self):
+        queryset = (
+            JSONFieldNullable.objects.alias(
+                element=self.table_source_class("json_field")
+            )
+            .filter(Q(pk=self.empty.pk) | Q(element="not-present"))
+            .order_by("element")
+        )
+        sql, _ = queryset.query.sql_with_params()
+
+        self.assertIn("CROSS JOIN", sql)
+        self.assertNotIn("LEFT OUTER JOIN", sql)
+
+        results = queryset.order_by("pk").values_list("pk", flat=True)
+        sql, _ = results.query.sql_with_params()
+
+        self.assertIn("LEFT OUTER JOIN", sql)
+        self.assertNotIn("CROSS JOIN", sql)
+        self.assertNotIn("LATERAL", sql)
+        self.assertSequenceEqual(list(results), [self.empty.pk])
+
     def test_or_then_aggregate_keeps_table_source_required(self):
         queryset = JSONFieldNullable.objects.alias(
             element=self.table_source_class("json_field")
