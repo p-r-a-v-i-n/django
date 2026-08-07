@@ -539,7 +539,7 @@ class Query(BaseExpression):
         # against each other.
         aggregates = {alias: self.annotations.pop(alias) for alias in aggregate_exprs}
         self.set_annotation_mask(annotation_select_mask)
-        self.demote_joins(self._gen_table_source_aliases(aggregates.values()))
+        self._require_table_sources(aggregates.values())
         # Existing usage of aggregation can be determined by the presence of
         # selected aggregates but also by filters against aliased aggregates.
         _, having, qualify = self.where.split_having_qualify()
@@ -1496,7 +1496,7 @@ class Query(BaseExpression):
             )
             self.annotations[alias] = expression
         if select:
-            self.demote_joins(self._gen_table_source_aliases([self.annotations[alias]]))
+            self._require_table_sources([self.annotations[alias]])
         if select and self.selected:
             self.selected[alias] = alias
 
@@ -2388,6 +2388,13 @@ class Query(BaseExpression):
             # This function might use the column of an earlier table source.
             aliases.extend(self._gen_col_aliases([join.srf_func]))
 
+    def _require_table_sources(self, expressions):
+        """
+        Make table sources referenced by expressions, including indirect
+        dependencies, required.
+        """
+        self.demote_joins(self._gen_table_source_aliases(expressions))
+
     def _gen_required_table_source_aliases(self):
         expressions = chain(
             (self.where,),
@@ -3051,7 +3058,7 @@ class Query(BaseExpression):
         self.add_fields(field_names, True)
         self.selected = selected if fields else None
         if self.selected:
-            self.demote_joins(self._gen_table_source_aliases(self.selected.values()))
+            self._require_table_sources(self.selected.values())
 
     @property
     def annotation_select(self):
