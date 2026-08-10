@@ -44,10 +44,10 @@ class NestedUnnest(Func):
     function = "unnest"
     output_field = CompositeField(
         number=IntegerField(),
-        item=CompositeField(
-            key=TextField(),
-            value=TextField(),
-        ),
+        **{
+            "item__key": TextField(),
+            "item__value": TextField(),
+        },
     )
     table_source = True
 
