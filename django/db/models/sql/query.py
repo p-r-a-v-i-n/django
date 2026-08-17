@@ -1602,9 +1602,7 @@ class Query(BaseExpression):
                         )
                     )
                     return expression_lookups, (), expression
-                table_subquery = self._get_multi_column_query(
-                    annotation_expression
-                )
+                table_subquery = self._get_multi_column_query(annotation_expression)
                 if table_subquery is not None:
                     expression, expression_lookups = self._resolve_inner_subquery_path(
                         table_subquery,
@@ -2742,15 +2740,19 @@ class Query(BaseExpression):
                 if item == "?":
                     continue
                 item = item.removeprefix("-")
-                if item in self.annotations or (
-                    self._get_multi_column_query(
-                        self.annotations.get(item.split(LOOKUP_SEP, 1)[0])
+                if (
+                    item in self.annotations
+                    or (
+                        self._get_multi_column_query(
+                            self.annotations.get(item.split(LOOKUP_SEP, 1)[0])
+                        )
+                        is not None
                     )
-                    is not None
-                ) or getattr(
-                    self.annotations.get(item.split(LOOKUP_SEP, 1)[0]),
-                    "table_source",
-                    False,
+                    or getattr(
+                        self.annotations.get(item.split(LOOKUP_SEP, 1)[0]),
+                        "table_source",
+                        False,
+                    )
                 ):
                     continue
                 if self.extra and item in self.extra:
