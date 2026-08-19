@@ -47,6 +47,7 @@ from django.db.models.sql.datastructures import (
     Empty,
     Join,
     MultiJoin,
+    SetReturningFunctionJoin,
     SubqueryJoin,
 )
 from django.db.models.sql.where import AND, OR, ExtraWhere, NothingNode, WhereNode
@@ -538,6 +539,7 @@ class Query(BaseExpression):
         # against each other.
         aggregates = {alias: self.annotations.pop(alias) for alias in aggregate_exprs}
         self.set_annotation_mask(annotation_select_mask)
+        self._require_table_sources(aggregates.values())
         # Existing usage of aggregation can be determined by the presence of
         # selected aggregates but also by filters against aliased aggregates.
         _, having, qualify = self.where.split_having_qualify()
@@ -1352,6 +1354,16 @@ class Query(BaseExpression):
                 cols.append(expression)
         return Tuple(*cols, output_field=output_field)
 
+    def _resolve_table_source_tuple(self, join, output_field):
+        from django.db.models.fields.tuple_lookups import Tuple
+
+        cols = []
+        for path, _ in output_field.get_fields():
+            column_name = LOOKUP_SEP.join(path)
+            field = join.get_field(column_name)
+            cols.append(Col(join.table_alias, field))
+        return Tuple(*cols, output_field=output_field)
+
     def _setup_inner_subquery_join(self, table_subquery, alias):
         if table_subquery.has_external_references():
             # TODO: Remove after OuterRef support.
@@ -1366,6 +1378,51 @@ class Query(BaseExpression):
         )
         table_alias = self.join(join)
         return self.alias_map[table_alias]
+
+    def _setup_set_returning_function_join(
+        self,
+        annotation,
+        alias,
+        field_name=None,
+    ):
+        self.get_initial_alias()
+        join = SetReturningFunctionJoin(
+            annotation,
+            alias,
+            None,
+        )
+        table_alias = self.join(join)
+        join = self.alias_map[table_alias]
+        if field_name is None and getattr(
+            annotation.output_field,
+            "is_composite",
+            False,
+        ):
+            return self._resolve_table_source_tuple(join, annotation.output_field)
+        field = join.get_field(field_name or alias)
+        return Col(join.table_alias, field)
+
+    def _resolve_set_returning_function_path(self, annotation, parts):
+        field_path = None
+        resolved_idx = 1
+        output_field = annotation.output_field
+        if getattr(output_field, "is_composite", False):
+            for idx in range(len(parts), 1, -1):
+                candidate = LOOKUP_SEP.join(parts[1:idx])
+                try:
+                    output_field.get_field(candidate)
+                except FieldError:
+                    continue
+                field_path = candidate
+                resolved_idx = idx
+                break
+
+        expression = self._setup_set_returning_function_join(
+            annotation,
+            parts[0],
+            field_path,
+        )
+        return expression, parts[resolved_idx:]
 
     def _resolve_inner_subquery_path(self, table_subquery, parts):
         """Resolve a table-source output and return the unused path parts."""
@@ -1389,18 +1446,44 @@ class Query(BaseExpression):
     def add_annotation(self, annotation, alias, select=True):
         """Add a single annotation expression to the Query."""
         self.check_alias(alias)
+        previous_annotation = self.annotations.get(alias)
         annotation = annotation.resolve_expression(self, allow_joins=True, reuse=None)
         table_subquery = self._get_multi_column_query(annotation)
-        if table_subquery is not None and LOOKUP_SEP in alias:
-            raise ValueError(
-                f"Multi-column subquery alias {alias!r} cannot contain the lookup "
-                f"separator {LOOKUP_SEP!r}."
+        if LOOKUP_SEP in alias:
+            if getattr(annotation, "table_source", False):
+                raise ValueError(
+                    f"Table source alias {alias!r} cannot contain the lookup "
+                    f"separator {LOOKUP_SEP!r}."
+                )
+            if table_subquery is not None:
+                raise ValueError(
+                    f"Multi-column subquery alias {alias!r} cannot contain the lookup "
+                    f"separator {LOOKUP_SEP!r}."
+                )
+        if (
+            select
+            and getattr(annotation, "table_source", False)
+            and getattr(annotation.output_field, "is_composite", False)
+        ):
+            raise NotImplementedError(
+                "Selecting a multi-column table source as an annotation is not "
+                "supported."
             )
         if select:
             self.append_annotation_mask([alias])
         else:
             self.set_annotation_mask(set(self.annotation_select).difference({alias}))
         self.annotations[alias] = annotation
+        if previous_annotation is not None:
+            self._release_table_sources([previous_annotation])
+        if select and getattr(annotation, "table_source", False):
+            expression, _ = self._resolve_set_returning_function_path(
+                annotation,
+                [alias],
+            )
+            self.annotations[alias] = expression
+        if select:
+            self._require_table_sources([self.annotations[alias]])
         if select and self.selected:
             self.selected[alias] = alias
 
@@ -1510,16 +1593,23 @@ class Query(BaseExpression):
                 lookup_splitted, self.annotations
             )
             if annotation:
-                table_subquery = self._get_multi_column_query(
-                    self.annotations[annotation]
-                )
+                annotation_expression = self.annotations[annotation]
+                if getattr(annotation_expression, "table_source", False):
+                    expression, expression_lookups = (
+                        self._resolve_set_returning_function_path(
+                            annotation_expression,
+                            lookup_splitted,
+                        )
+                    )
+                    return expression_lookups, (), expression
+                table_subquery = self._get_multi_column_query(annotation_expression)
                 if table_subquery is not None:
                     expression, expression_lookups = self._resolve_inner_subquery_path(
                         table_subquery,
                         lookup_splitted,
                     )
                     return expression_lookups, (), expression
-                expression = self.annotations[annotation]
+                expression = annotation_expression
                 if summarize:
                     expression = Ref(annotation, expression)
                 return expression_lookups, (), expression
@@ -1724,7 +1814,8 @@ class Query(BaseExpression):
             )
             if not isinstance(condition, Lookup):
                 condition = self.build_lookup(["exact"], condition, True)
-            return WhereNode([condition], connector=AND), []
+            used_joins = set(self._gen_table_source_aliases([condition]))
+            return WhereNode([condition], connector=AND), used_joins
         arg, value = filter_expr
         if not arg:
             raise FieldError("Cannot parse keyword query %r" % arg)
@@ -1756,7 +1847,8 @@ class Query(BaseExpression):
             ):
                 lookup_class = condition.lhs.get_lookup("isnull")
                 clause.add(lookup_class(condition.lhs, False), AND)
-            return clause, []
+            used_joins.update(self._gen_table_source_aliases([condition]))
+            return clause, used_joins
 
         opts = self.get_meta()
         alias = self.get_initial_alias()
@@ -1867,8 +1959,18 @@ class Query(BaseExpression):
         # (Consider case where rel_a is LOUTER and rel_a__col=1 is added - if
         # rel_a doesn't produce any rows, then the whole condition must fail.
         # So, demotion is OK.
+        # A table source join may already exist only because another table
+        # source depends on it. Don't let such a dependency-only join override
+        # the join type required by q_object.
+        required_table_sources = set(self._gen_required_table_source_aliases())
         existing_inner = {
-            a for a in self.alias_map if self.alias_map[a].join_type == INNER
+            alias
+            for alias, join in self.alias_map.items()
+            if join.join_type == INNER
+            and (
+                not isinstance(join, SetReturningFunctionJoin)
+                or alias in required_table_sources
+            )
         }
         if reuse_all:
             can_reuse = set(self.alias_map)
@@ -2255,18 +2357,82 @@ class Query(BaseExpression):
     def _gen_col_aliases(cls, exprs):
         yield from (expr.alias for expr in cls._gen_cols(exprs))
 
+    def _gen_direct_table_source_aliases(self, expressions):
+        """Yield table sources used directly by the given expressions."""
+        for alias in self._gen_col_aliases(expressions):
+            if isinstance(self.alias_map.get(alias), SetReturningFunctionJoin):
+                yield alias
+
+    def _gen_table_source_aliases(self, exprs):
+        """
+        Yield all table sources used by the given expressions. Also include
+        earlier table sources used by another table source.
+        """
+        aliases = list(self._gen_direct_table_source_aliases(exprs))
+        seen = set()
+
+        while aliases:
+            alias = aliases.pop()
+            if alias in seen:
+                continue
+            seen.add(alias)
+            join = self.alias_map.get(alias)
+            yield alias
+            # This function might use the column of an earlier table source.
+            aliases.extend(self._gen_direct_table_source_aliases([join.srf_func]))
+
+    def _require_table_sources(self, expressions):
+        """
+        Make table sources used by the expressions use an inner join. Also
+        include earlier table sources used by another table source.
+        """
+        self.demote_joins(self._gen_table_source_aliases(expressions))
+
+    def _release_table_sources(self, expressions):
+        """
+        Release table sources used directly by the given expressions. Keep a
+        source if the query still uses it. When a source becomes unused, also
+        release the earlier table sources that it uses.
+        """
+        referenced_table_sources = set(self._gen_required_table_source_aliases())
+        aliases = list(self._gen_direct_table_source_aliases(expressions))
+        while aliases:
+            alias = aliases.pop()
+            if self.alias_refcount[alias] == 1 and alias in referenced_table_sources:
+                continue
+            self.unref_alias(alias)
+            if self.alias_refcount[alias] == 0:
+                join = self.alias_map[alias]
+                aliases.extend(self._gen_direct_table_source_aliases([join.srf_func]))
+
+    def _gen_required_table_source_aliases(self):
+        """
+        Yield table sources that must remain available to the query. Check
+        filters, selected expressions, annotations, and grouping.
+        """
+        expressions = chain(
+            (self.where,),
+            self.annotation_select.values(),
+            self.select,
+            self.selected.values() if self.selected else (),
+        )
+        if self.group_by not in (None, True):
+            expressions = chain(expressions, self.group_by)
+        yield from self._gen_table_source_aliases(expressions)
+
     def resolve_ref(self, name, allow_joins=True, reuse=None, summarize=False):
         annotation = self.annotations.get(name)
         if annotation is not None:
+            is_table_source = getattr(annotation, "table_source", False)
             table_subquery = self._get_multi_column_query(annotation)
             is_multi_column_query = table_subquery is not None
-            if not allow_joins and is_multi_column_query:
+            if not allow_joins and (is_table_source or is_multi_column_query):
                 raise FieldError(
                     "Joined field references are not permitted in this query"
                 )
             if not allow_joins:
                 for alias in self._gen_col_aliases([annotation]):
-                    if isinstance(self.alias_map[alias], Join):
+                    if self.alias_map[alias].join_type is not None:
                         raise FieldError(
                             "Joined field references are not permitted in this query"
                         )
@@ -2283,6 +2449,12 @@ class Query(BaseExpression):
                     )
                 return Ref(name, self.annotation_select[name])
             else:
+                if is_table_source:
+                    expression, _ = self._resolve_set_returning_function_path(
+                        annotation,
+                        [name],
+                    )
+                    return expression
                 if is_multi_column_query:
                     join = self._setup_inner_subquery_join(table_subquery, name)
                     return self._resolve_inner_subquery_tuple(join)
@@ -2290,12 +2462,21 @@ class Query(BaseExpression):
         else:
             field_list = name.split(LOOKUP_SEP)
             annotation = self.annotations.get(field_list[0])
+            is_table_source = getattr(annotation, "table_source", False)
             table_subquery = self._get_multi_column_query(annotation)
             is_multi_column_query = table_subquery is not None
-            if not allow_joins and is_multi_column_query:
+            if not allow_joins and (is_table_source or is_multi_column_query):
                 raise FieldError(
                     "Joined field references are not permitted in this query"
                 )
+            if is_table_source:
+                expression, transforms = self._resolve_set_returning_function_path(
+                    annotation,
+                    field_list,
+                )
+                for transform in transforms:
+                    expression = self.try_transform(expression, transform)
+                return expression
             if is_multi_column_query:
                 expression, transforms = self._resolve_inner_subquery_path(
                     table_subquery,
@@ -2559,11 +2740,19 @@ class Query(BaseExpression):
                 if item == "?":
                     continue
                 item = item.removeprefix("-")
-                if item in self.annotations or (
-                    self._get_multi_column_query(
-                        self.annotations.get(item.split(LOOKUP_SEP, 1)[0])
+                if (
+                    item in self.annotations
+                    or (
+                        self._get_multi_column_query(
+                            self.annotations.get(item.split(LOOKUP_SEP, 1)[0])
+                        )
+                        is not None
                     )
-                    is not None
+                    or getattr(
+                        self.annotations.get(item.split(LOOKUP_SEP, 1)[0]),
+                        "table_source",
+                        False,
+                    )
                 ):
                     continue
                 if self.extra and item in self.extra:
@@ -2886,6 +3075,8 @@ class Query(BaseExpression):
         self.values_select = tuple(field_names)
         self.add_fields(field_names, True)
         self.selected = selected if fields else None
+        if self.selected:
+            self._require_table_sources(self.selected.values())
 
     @property
     def annotation_select(self):

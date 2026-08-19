@@ -4,6 +4,7 @@ the SQL domain.
 """
 
 from django.core.exceptions import FullResultSet
+from django.db.models.constants import LOOKUP_SEP
 from django.db.models.sql.constants import INNER, LOUTER
 
 
@@ -256,6 +257,109 @@ class SubqueryJoin:
         new = self.relabeled_clone({})
         new.join_type = LOUTER
         return new
+
+
+class SetReturningFunctionJoin:
+    filtered_relation = None
+
+    def __init__(
+        self,
+        srf_func,
+        table_name,
+        table_alias,
+    ):
+        self.table_name = table_name
+        self.parent_alias = None
+        # Join table
+        self.srf_func = srf_func
+        self.table_alias = table_alias
+        # INNER or LOUTER
+        self.join_type = INNER
+        # Is this join nullabled?
+        self.nullable = True
+
+    def _join_sql(self):
+        if self.join_type == LOUTER:
+            return LOUTER, " ON (1 = 1)"
+        return "CROSS JOIN", ""
+
+    def as_sql(self, compiler, connection):
+        sql, params = compiler.compile(self.srf_func)
+        alias = compiler.quote_name(self.table_alias)
+        join_type, on_clause = self._join_sql()
+        return (
+            f"{join_type} {sql} {alias}{on_clause}",
+            params,
+        )
+
+    def as_postgresql(self, compiler, connection):
+        sql, params = compiler.compile(self.srf_func)
+        alias = compiler.quote_name(self.table_alias)
+        output_field = self.srf_func.output_field
+
+        if getattr(output_field, "is_composite", False):
+            column_names = (
+                field.db_column or LOOKUP_SEP.join(path)
+                for path, field in output_field.get_fields()
+            )
+        else:
+            column_names = (output_field.db_column or self.table_name,)
+
+        columns = ", ".join(compiler.quote_name(name) for name in column_names)
+
+        join_type, on_clause = self._join_sql()
+        return (
+            f"{join_type} LATERAL {sql} AS {alias}({columns}){on_clause}",
+            params,
+        )
+
+    def relabeled_clone(self, change_map):
+        clone = self.__class__(
+            self.srf_func.relabeled_clone(change_map),
+            self.table_name,
+            change_map.get(self.table_alias, self.table_alias),
+        )
+        clone.join_type = self.join_type
+        return clone
+
+    def get_field(self, name):
+        field = self.srf_func.output_field
+        if getattr(field, "is_composite", False):
+            field = field.get_field(name)
+        if field.is_relation:
+            field = field.target_field
+
+        field = field.clone()
+        field.model = None
+        field.name = name
+        field.column = field.db_column or name
+        return field
+
+    def demote(self):
+        new = self.relabeled_clone({})
+        new.join_type = INNER
+        return new
+
+    def promote(self):
+        new = self.relabeled_clone({})
+        new.join_type = LOUTER
+        return new
+
+    @property
+    def identity(self):
+        return (
+            self.__class__,
+            self.table_name,
+            self.srf_func,
+        )
+
+    def __eq__(self, other):
+        if not isinstance(other, SetReturningFunctionJoin):
+            return NotImplemented
+        return self.identity == other.identity
+
+    def __hash__(self):
+        return hash(self.identity)
 
 
 class BaseTable:

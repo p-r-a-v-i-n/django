@@ -30,6 +30,7 @@ from django.db.models.sql.constants import (
     ROW_COUNT,
     SINGLE,
 )
+from django.db.models.sql.datastructures import SetReturningFunctionJoin
 from django.db.models.sql.query import Query, get_order_dir
 from django.db.transaction import TransactionManagementError
 from django.utils.deprecation import RemovedInDjango70Warning
@@ -457,7 +458,13 @@ class SQLCompiler:
                     Query._get_multi_column_query(expr) is not None
                     and ref not in self.query.annotation_select
                 )
-                if is_multi_column_subquery and not self.query.combinator:
+                is_table_source = (
+                    getattr(expr, "table_source", False)
+                    and ref not in self.query.annotation_select
+                )
+                if (
+                    is_multi_column_subquery or is_table_source
+                ) and not self.query.combinator:
                     # The part after a multi-column annotation may
                     # be a derived-table column, not a transform.
                     # Resolve the full name first.
@@ -544,6 +551,7 @@ class SQLCompiler:
         seen = set()
         for expr, is_ref in self._order_by_pairs():
             resolved = expr.resolve_expression(self.query, allow_joins=True, reuse=None)
+            self.query._require_table_sources([resolved])
             if not is_ref and self.query.combinator and self.select:
                 src = resolved.expression
                 expr_src = expr.expression
@@ -817,6 +825,11 @@ class SQLCompiler:
         in the query.
         """
         refcounts_before = self.query.alias_refcount.copy()
+        table_source_joins_before = {
+            alias: join
+            for alias, join in self.query.alias_map.items()
+            if isinstance(join, SetReturningFunctionJoin)
+        }
         try:
             combinator = self.query.combinator
             extra_select, order_by, group_by = self.pre_sql_setup(
@@ -1032,7 +1045,8 @@ class SQLCompiler:
 
             return " ".join(result), tuple(params)
         finally:
-            # Finally do cleanup - get rid of the joins we created above.
+            # Restore table source joins and remove joins created above.
+            self.query.alias_map.update(table_source_joins_before)
             self.query.reset_refcounts(refcounts_before)
 
     def get_default_columns(
