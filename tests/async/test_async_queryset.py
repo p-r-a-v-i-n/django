@@ -1,6 +1,7 @@
 import json
 import xml.etree.ElementTree
 from datetime import datetime
+from unittest import mock
 
 from asgiref.sync import async_to_sync, sync_to_async
 
@@ -224,6 +225,19 @@ class AsyncQuerySetTest(TestCase):
 
         check = await SimpleModel.objects.filter(field=4).aexists()
         self.assertIs(check, False)
+
+    async def test_aexists_uses_async_query(self):
+        queryset = SimpleModel.objects.filter(field=1)
+
+        with mock.patch.object(
+            queryset.query,
+            "ahas_results",
+            new=mock.AsyncMock(return_value=True),
+        ) as ahas_results:
+            result = await queryset.aexists()
+
+        self.assertIs(result, True)
+        ahas_results.assert_awaited_once_with(using=queryset.db)
 
     async def test_acontains(self):
         check = await SimpleModel.objects.acontains(self.s1)

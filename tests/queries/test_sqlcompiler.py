@@ -41,6 +41,22 @@ class SQLCompilerTest(TestCase):
         self.assertIsNone(exc.__cause__)
         self.assertTrue(exc.__suppress_context__)
 
+    async def test_ahas_results_uses_async_connection(self):
+        query = Query(Item).exists()
+        compiler = query.get_compiler(DEFAULT_DB_ALIAS, connection)
+        sql, params = compiler.as_sql()
+
+        with mock.patch.object(
+            connection,
+            "aexecute",
+            new=mock.AsyncMock(return_value=[(1,)]),
+            create=True,
+        ) as aexecute:
+            result = await compiler.ahas_results()
+
+        self.assertIs(result, True)
+        aexecute.assert_awaited_once_with(sql, params)
+
     # RemovedInDjango2028Warning: When the deprecation ends, remove this
     # test.
     def test_quote_name_unless_alias_deprecation(self):

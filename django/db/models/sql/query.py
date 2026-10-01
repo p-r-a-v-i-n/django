@@ -17,6 +17,8 @@ from collections.abc import Iterable, Iterator, Mapping
 from itertools import chain, count, product
 from string import ascii_uppercase
 
+from asgiref.sync import sync_to_async
+
 from django.core.exceptions import FieldDoesNotExist, FieldError
 from django.db import DEFAULT_DB_ALIAS, NotSupportedError, connections
 from django.db.models.aggregates import Count
@@ -685,6 +687,13 @@ class Query(BaseExpression):
         q = self.exists()
         compiler = q.get_compiler(using=using)
         return compiler.has_results()
+
+    async def ahas_results(self, using):
+        if not hasattr(connections[using], "aexecute"):
+            return await sync_to_async(self.has_results)(using=using)
+        q = self.exists()
+        compiler = q.get_compiler(using=using)
+        return await compiler.ahas_results()
 
     def explain(self, using, format=None, **options):
         q = self.clone()
