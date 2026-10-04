@@ -1513,6 +1513,12 @@ class QuerySet(AltersData):
         return bool(self._result_cache)
 
     async def aexists(self):
+        if type(self).exists is not QuerySet.exists:
+            return await sync_to_async(self.exists)()
+        if self._result_cache is not None:
+            return bool(self._result_cache)
+        if connections[self.db].features.supports_async:
+            return await self.query.ahas_results(using=self.db)
         return await sync_to_async(self.exists)()
 
     def contains(self, obj):
