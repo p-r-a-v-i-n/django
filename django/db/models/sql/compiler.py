@@ -2,6 +2,7 @@ import collections
 import json
 import re
 import warnings
+from contextlib import aclosing
 from functools import partial
 from itertools import chain
 
@@ -1610,6 +1611,35 @@ class SQLCompiler:
         if tuple_expected:
             rows = map(tuple, rows)
         return rows
+
+    async def aresults_iter(
+        self,
+        results=None,
+        tuple_expected=False,
+        chunked_fetch=False,
+        chunk_size=GET_ITERATOR_CHUNK_SIZE,
+    ):
+        """Return an async iterator over the rows from this query."""
+        if results is None:
+            results = await self.aexecute_sql(
+                MULTI,
+                chunked_fetch=chunked_fetch,
+                chunk_size=chunk_size,
+            )
+        fields = [s[0] for s in self.select[0 : self.col_count]]
+        converters = self.get_converters(fields)
+
+        async with aclosing(results):
+            async for batch in results:
+                rows = batch
+                if converters:
+                    rows = self.apply_converters(rows, converters)
+                if self.has_composite_fields(fields):
+                    rows = self.composite_fields_to_tuples(rows, fields)
+                if tuple_expected:
+                    rows = map(tuple, rows)
+                for row in rows:
+                    yield row
 
     def has_results(self):
         """

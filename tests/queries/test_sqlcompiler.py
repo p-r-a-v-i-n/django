@@ -296,7 +296,7 @@ class SQLCompilerTest(TestCase):
             new=mock.AsyncMock(return_value=results()),
         ):
             rows = compiler.aresults_iter()
-            self.assertEqual(await anext(rows), (1,))
+            self.assertEqual(await anext(rows), [1])
             await rows.aclose()
 
         self.assertIs(results_closed, True)
