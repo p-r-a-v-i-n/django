@@ -1668,11 +1668,7 @@ class QuerySet(AltersData):
 
     _raw_delete.alters_data = True
 
-    def update(self, **kwargs):
-        """
-        Update all elements in the current QuerySet, setting all the given
-        fields to the appropriate values.
-        """
+    def _update_query(self, kwargs):
         self._not_support_combined_queries("update")
         if self.query.is_sliced:
             raise TypeError("Cannot update a query once a slice has been taken.")
@@ -1705,6 +1701,14 @@ class QuerySet(AltersData):
         # Clear SELECT clause as all annotation references were inlined by
         # add_update_values() already.
         query.clear_select_clause()
+        return query
+
+    def update(self, **kwargs):
+        """
+        Update all elements in the current QuerySet, setting all the given
+        fields to the appropriate values.
+        """
+        query = self._update_query(kwargs)
         with transaction.mark_for_rollback_on_error(using=self.db):
             rows = query.get_compiler(self.db).execute_sql(ROW_COUNT)
         self._result_cache = None
@@ -1713,6 +1717,14 @@ class QuerySet(AltersData):
     update.alters_data = True
 
     async def aupdate(self, **kwargs):
+        if (
+            type(self).update is QuerySet.update
+            and connections[self.db].features.supports_async
+        ):
+            query = self._update_query(kwargs)
+            rows = await query.get_compiler(self.db).aexecute_sql(ROW_COUNT)
+            self._result_cache = None
+            return rows
         return await sync_to_async(self.update)(**kwargs)
 
     aupdate.alters_data = True
