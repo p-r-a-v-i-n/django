@@ -265,6 +265,29 @@ class AsyncQuerySetTest(TestCase):
         self.assertIs(result, True)
         ahas_results.assert_awaited_once_with(using=queryset.db)
 
+    async def test_aexists_uses_result_cache_with_async_support(self):
+        queryset = SimpleModel.objects.all()
+        queryset._result_cache = [self.s1]
+
+        with (
+            mock.patch.object(
+                connection.features,
+                "supports_async",
+                True,
+                create=True,
+            ),
+            mock.patch.object(
+                queryset.query,
+                "ahas_results",
+                new=mock.AsyncMock(),
+                create=True,
+            ) as ahas_results,
+        ):
+            result = await queryset.aexists()
+
+        self.assertIs(result, True)
+        ahas_results.assert_not_awaited()
+
     async def test_aexists_preserves_custom_exists_override(self):
         class CustomQuerySet(QuerySet):
             exists_called = False
