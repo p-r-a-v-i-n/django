@@ -807,14 +807,7 @@ class QuerySet(AltersData):
                 async for item in iterator:
                     yield item
 
-    def aggregate(self, *args, **kwargs):
-        """
-        Return a dictionary containing the calculations (aggregation)
-        over the current queryset.
-
-        If args is present the expression is passed as a kwarg using
-        the Aggregate object's default alias.
-        """
+    def _validate_aggregate_args(self, args, kwargs):
         if self.query.distinct_fields:
             raise NotImplementedError("aggregate() + distinct(fields) not implemented.")
         self._validate_values_are_expressions(
@@ -829,10 +822,27 @@ class QuerySet(AltersData):
             except (AttributeError, TypeError):
                 raise TypeError("Complex aggregates require an alias")
             kwargs[arg.default_alias] = arg
+        return kwargs
+
+    def aggregate(self, *args, **kwargs):
+        """
+        Return a dictionary containing the calculations (aggregation)
+        over the current queryset.
+
+        If args is present the expression is passed as a kwarg using
+        the Aggregate object's default alias.
+        """
+        kwargs = self._validate_aggregate_args(args, kwargs)
 
         return self.query.chain().get_aggregation(self.db, kwargs)
 
     async def aaggregate(self, *args, **kwargs):
+        if (
+            type(self).aggregate is QuerySet.aggregate
+            and connections[self.db].features.supports_async
+        ):
+            kwargs = self._validate_aggregate_args(args, kwargs)
+            return await self.query.chain().aget_aggregation(self.db, kwargs)
         return await sync_to_async(self.aggregate)(*args, **kwargs)
 
     def count(self):
@@ -849,6 +859,13 @@ class QuerySet(AltersData):
         return self.query.get_count(using=self.db)
 
     async def acount(self):
+        if (
+            type(self).count is QuerySet.count
+            and connections[self.db].features.supports_async
+        ):
+            if self._result_cache is not None:
+                return len(self._result_cache)
+            return await self.query.aget_count(using=self.db)
         return await sync_to_async(self.count)()
 
     def _get_query(self, args, kwargs):
@@ -1797,6 +1814,13 @@ class QuerySet(AltersData):
         return self.query.explain(using=self.db, format=format, **options)
 
     async def aexplain(self, *, format=None, **options):
+        if (
+            type(self).explain is QuerySet.explain
+            and connections[self.db].features.supports_async
+        ):
+            return await self.query.aexplain(
+                using=self.db, format=format, **options
+            )
         return await sync_to_async(self.explain)(format=format, **options)
 
     ##################################################

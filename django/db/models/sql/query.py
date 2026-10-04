@@ -457,12 +457,12 @@ class Query(BaseExpression):
             alias = None
         return target.get_col(alias, field)
 
-    def get_aggregation(self, using, aggregate_exprs):
+    def _get_aggregation_query(self, using, aggregate_exprs):
         """
-        Return the dictionary with the values of the existing aggregations.
+        Build the compiler and result metadata for an aggregation query.
         """
         if not aggregate_exprs:
-            return {}
+            return None
         # Store annotation mask prior to temporarily adding aggregations for
         # resolving purpose to facilitate their subsequent removal.
         refs_subquery = False
@@ -638,7 +638,10 @@ class Query(BaseExpression):
         outer_query.select_for_update = False
         outer_query.select_related = False
         compiler = outer_query.get_compiler(using, elide_empty=elide_empty)
-        result = compiler.execute_sql(SINGLE)
+        return outer_query, compiler, empty_set_result
+
+    @staticmethod
+    def _get_aggregation_result(outer_query, compiler, empty_set_result, result):
         if result is None:
             result = empty_set_result
         else:
@@ -651,12 +654,44 @@ class Query(BaseExpression):
 
         return dict(zip(outer_query.annotation_select, result))
 
+    def get_aggregation(self, using, aggregate_exprs):
+        """
+        Return the dictionary with the values of the existing aggregations.
+        """
+        query = self._get_aggregation_query(using, aggregate_exprs)
+        if query is None:
+            return {}
+        outer_query, compiler, empty_set_result = query
+        result = compiler.execute_sql(SINGLE)
+        return self._get_aggregation_result(
+            outer_query, compiler, empty_set_result, result
+        )
+
+    async def aget_aggregation(self, using, aggregate_exprs):
+        if type(self).get_aggregation is not Query.get_aggregation:
+            return await sync_to_async(self.get_aggregation)(using, aggregate_exprs)
+        query = self._get_aggregation_query(using, aggregate_exprs)
+        if query is None:
+            return {}
+        outer_query, compiler, empty_set_result = query
+        result = await compiler.aexecute_sql(SINGLE)
+        return self._get_aggregation_result(
+            outer_query, compiler, empty_set_result, result
+        )
+
     def get_count(self, using):
         """
         Perform a COUNT() query using the current filter constraints.
         """
         obj = self.clone()
         return obj.get_aggregation(using, {"__count": Count("*")})["__count"]
+
+    async def aget_count(self, using):
+        if type(self).get_count is not Query.get_count:
+            return await sync_to_async(self.get_count)(using)
+        obj = self.clone()
+        result = await obj.aget_aggregation(using, {"__count": Count("*")})
+        return result["__count"]
 
     def has_filters(self):
         return self.where
@@ -695,7 +730,7 @@ class Query(BaseExpression):
         compiler = q.get_compiler(using=using)
         return await compiler.ahas_results()
 
-    def explain(self, using, format=None, **options):
+    def _explain_query(self, using, format, options):
         q = self.clone()
         for option_name in options:
             if (
@@ -704,8 +739,17 @@ class Query(BaseExpression):
             ):
                 raise ValueError(f"Invalid option name: {option_name!r}.")
         q.explain_info = ExplainInfo(format, options)
-        compiler = q.get_compiler(using=using)
+        return q.get_compiler(using=using)
+
+    def explain(self, using, format=None, **options):
+        compiler = self._explain_query(using, format, options)
         return "\n".join(compiler.explain_query())
+
+    async def aexplain(self, using, format=None, **options):
+        if type(self).explain is not Query.explain:
+            return await sync_to_async(self.explain)(using, format, **options)
+        compiler = self._explain_query(using, format, options)
+        return "\n".join([line async for line in compiler.aexplain_query()])
 
     def combine(self, rhs, connector):
         """

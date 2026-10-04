@@ -1792,17 +1792,33 @@ class SQLCompiler:
             return list(result)
         return result
 
-    def explain_query(self):
-        result = list(self.execute_sql())
+    def _format_explain_rows(self, rows):
         # Some backends return 1 item tuples with strings, and others return
         # tuples with integers and strings. Flatten them out into strings.
         format_ = self.query.explain_info.format
         output_formatter = json.dumps if format_ and format_.lower() == "json" else str
-        for row in result:
+        for row in rows:
             for value in row:
                 if not isinstance(value, str):
                     yield " ".join([output_formatter(c) for c in value])
                 else:
+                    yield value
+
+    def explain_query(self):
+        result = list(self.execute_sql())
+        yield from self._format_explain_rows(result)
+
+    async def aexplain_query(self):
+        if type(self).explain_query is not SQLCompiler.explain_query:
+            result = await sync_to_async(list)(self.explain_query)()
+            for value in result:
+                yield value
+            return
+
+        results = await self.aexecute_sql(MULTI)
+        async with aclosing(results):
+            async for rows in results:
+                for value in self._format_explain_rows(rows):
                     yield value
 
 
