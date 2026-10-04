@@ -1,4 +1,5 @@
 from datetime import datetime
+from unittest import mock
 
 from django.core.exceptions import FieldError
 from django.db import DEFAULT_DB_ALIAS, connection
@@ -24,6 +25,36 @@ from .models import Author, Item, ObjectC, Ranking
 
 
 class TestQuery(SimpleTestCase):
+    async def test_ahas_results_uses_async_compiler(self):
+        query = Query(Item)
+        compiler = mock.MagicMock()
+        compiler.ahas_results = mock.AsyncMock(return_value=True)
+        exists_query = mock.MagicMock()
+        exists_query.get_compiler.return_value = compiler
+
+        with mock.patch.object(query, "exists", return_value=exists_query) as exists:
+            result = await query.ahas_results(DEFAULT_DB_ALIAS)
+
+        self.assertIs(result, True)
+        exists.assert_called_once_with()
+        exists_query.get_compiler.assert_called_once_with(using=DEFAULT_DB_ALIAS)
+        compiler.ahas_results.assert_awaited_once_with()
+
+    async def test_ahas_results_preserves_custom_has_results_override(self):
+        class CustomQuery(Query):
+            has_results_called = False
+
+            def has_results(self, using):
+                self.has_results_called = True
+                return False
+
+        query = CustomQuery(Item)
+
+        result = await query.ahas_results(DEFAULT_DB_ALIAS)
+
+        self.assertIs(result, False)
+        self.assertIs(query.has_results_called, True)
+
     def test_simple_query(self):
         query = Query(Author)
         where = query.build_where(Q(num__gt=2))
