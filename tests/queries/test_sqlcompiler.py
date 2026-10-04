@@ -223,6 +223,84 @@ class SQLCompilerTest(TestCase):
 
         async_cursor.__aexit__.assert_awaited_once()
 
+    async def test_aresults_iter_flattens_batches_and_converts_rows(self):
+        compiler = (
+            Query(Item)
+            .exists()
+            .get_compiler(
+                DEFAULT_DB_ALIAS,
+                connection,
+            )
+        )
+        compiler.as_sql()
+        expression = compiler.select[0][0]
+
+        def add_one(value, expression, connection):
+            return value + 1
+
+        async def results():
+            yield [(1,), (2,)]
+            yield [(3,)]
+
+        with (
+            mock.patch.object(
+                compiler,
+                "aexecute_sql",
+                new=mock.AsyncMock(return_value=results()),
+            ) as aexecute_sql,
+            mock.patch.object(
+                compiler,
+                "get_converters",
+                return_value={0: ([add_one], expression)},
+            ),
+        ):
+            rows = [
+                row
+                async for row in compiler.aresults_iter(
+                    tuple_expected=True,
+                    chunked_fetch=True,
+                    chunk_size=2,
+                )
+            ]
+
+        self.assertEqual(rows, [(2,), (3,), (4,)])
+        aexecute_sql.assert_awaited_once_with(
+            MULTI,
+            chunked_fetch=True,
+            chunk_size=2,
+        )
+
+    async def test_aresults_iter_closes_partially_consumed_results(self):
+        compiler = (
+            Query(Item)
+            .exists()
+            .get_compiler(
+                DEFAULT_DB_ALIAS,
+                connection,
+            )
+        )
+        compiler.as_sql()
+        results_closed = False
+
+        async def results():
+            nonlocal results_closed
+            try:
+                yield [(1,)]
+                yield [(2,)]
+            finally:
+                results_closed = True
+
+        with mock.patch.object(
+            compiler,
+            "aexecute_sql",
+            new=mock.AsyncMock(return_value=results()),
+        ):
+            rows = compiler.aresults_iter()
+            self.assertEqual(await anext(rows), (1,))
+            await rows.aclose()
+
+        self.assertIs(results_closed, True)
+
     async def test_ahas_results_uses_async_execution(self):
         compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
 
