@@ -7,6 +7,7 @@ from asgiref.sync import async_to_sync, sync_to_async
 
 from django.db import NotSupportedError, connection
 from django.db.models import Prefetch, QuerySet, Sum
+from django.db.models.query import ValuesListIterable
 from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
 from django.utils.deprecation import RemovedInDjango2029Warning
 
@@ -51,6 +52,137 @@ class AsyncQuerySetTest(TestCase):
         async for m in qs:
             results.append(m)
         self.assertCountEqual(results, [self.s1, self.s2, self.s3])
+
+    async def test_native_async_iteration_iterable_types(self):
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchall = mock.AsyncMock(
+            side_effect=[
+                [(self.s1.pk, 1), (self.s2.pk, 2), (self.s3.pk, 3)],
+                [(1,), (2,), (3,)],
+                [(1,), (2,), (3,)],
+                [(1,), (2,), (3,)],
+                [(1,), (2,), (3,)],
+            ]
+        )
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with (
+            mock.patch.object(connection.features, "supports_async", True),
+            mock.patch.object(
+                connection,
+                "acursor",
+                return_value=async_cursor,
+                create=True,
+            ) as acursor,
+        ):
+            models = [
+                obj
+                async for obj in SimpleModel.objects.only("field").order_by("pk")
+            ]
+            values = [
+                value
+                async for value in SimpleModel.objects.order_by("pk").values("field")
+            ]
+            tuples = [
+                value
+                async for value in SimpleModel.objects.order_by("pk").values_list(
+                    "field"
+                )
+            ]
+            flat_values = [
+                value
+                async for value in SimpleModel.objects.order_by("pk").values_list(
+                    "field", flat=True
+                )
+            ]
+            named_values = [
+                value
+                async for value in SimpleModel.objects.order_by("pk").values_list(
+                    "field", named=True
+                )
+            ]
+
+        self.assertEqual(models, [self.s1, self.s2, self.s3])
+        self.assertEqual(values, [{"field": 1}, {"field": 2}, {"field": 3}])
+        self.assertEqual(tuples, [(1,), (2,), (3,)])
+        self.assertEqual(flat_values, [1, 2, 3])
+        self.assertEqual([value.field for value in named_values], [1, 2, 3])
+        self.assertEqual(acursor.call_count, 5)
+        self.assertEqual(cursor.afetchall.await_count, 5)
+
+    async def test_native_aiterator_fetches_rows_in_chunks(self):
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchmany = mock.AsyncMock(
+            side_effect=[
+                [(self.s1.pk, 1), (self.s2.pk, 2)],
+                [(self.s3.pk, 3)],
+                [],
+            ]
+        )
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with (
+            mock.patch.object(connection.features, "supports_async", True),
+            mock.patch.object(
+                connection,
+                "acursor",
+                return_value=async_cursor,
+                create=True,
+            ),
+        ):
+            results = [
+                obj
+                async for obj in SimpleModel.objects.only("field")
+                .order_by("pk")
+                .aiterator(chunk_size=2)
+            ]
+
+        self.assertEqual(results, [self.s1, self.s2, self.s3])
+        self.assertEqual(
+            cursor.afetchmany.await_args_list,
+            [mock.call(2), mock.call(2), mock.call(2)],
+        )
+
+    async def test_native_aiterator_closes_partially_consumed_results(self):
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchmany = mock.AsyncMock(return_value=[(1,)])
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with (
+            mock.patch.object(connection.features, "supports_async", True),
+            mock.patch.object(
+                connection,
+                "acursor",
+                return_value=async_cursor,
+                create=True,
+            ),
+        ):
+            iterator = SimpleModel.objects.values_list("field", flat=True).aiterator(
+                chunk_size=1
+            )
+            self.assertEqual(await anext(iterator), 1)
+            await iterator.aclose()
+
+        async_cursor.__aexit__.assert_awaited_once()
+
+    async def test_native_aiterator_preserves_custom_iterable(self):
+        class CustomIterable(ValuesListIterable):
+            def __iter__(self):
+                yield "custom"
+
+        queryset = SimpleModel.objects.all()
+        queryset._iterable_class = CustomIterable
+
+        with mock.patch.object(connection.features, "supports_async", True):
+            results = [result async for result in queryset.aiterator()]
+
+        self.assertEqual(results, ["custom"])
 
     async def test_aiterator_prefetch_related(self):
         results = []
