@@ -3,6 +3,8 @@ from django.utils.functional import cached_property
 
 
 class BaseDatabaseFeatures:
+    supports_async = False
+
     # An optional tuple indicating the minimum supported database version.
     minimum_database_version = None
     gis_enabled = False
