@@ -133,12 +133,95 @@ class SQLCompilerTest(TestCase):
         cursor.afetchone.assert_not_awaited()
         async_cursor.__aexit__.assert_awaited_once()
 
-    async def test_aexecute_sql_rejects_unsupported_result_type(self):
+    async def test_aexecute_sql_multi_fetches_all_rows(self):
         compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
-        msg = "Async query execution currently supports SINGLE results only."
+        sql, params = compiler.as_sql()
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchall = mock.AsyncMock(return_value=[(1,), (2,)])
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
 
-        with self.assertRaisesMessage(NotImplementedError, msg):
-            await compiler.aexecute_sql(MULTI)
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ):
+            results = await compiler.aexecute_sql(MULTI)
+            batches = [batch async for batch in results]
+
+        self.assertEqual(batches, [[(1,), (2,)]])
+        cursor.aexecute.assert_awaited_once_with(sql, params)
+        cursor.afetchall.assert_awaited_once_with()
+        async_cursor.__aexit__.assert_awaited_once()
+
+    async def test_aexecute_sql_multi_fetches_rows_in_chunks(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchmany = mock.AsyncMock(
+            side_effect=[[(1,), (2,)], [(3,)], []],
+        )
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ):
+            results = await compiler.aexecute_sql(
+                MULTI,
+                chunked_fetch=True,
+                chunk_size=2,
+            )
+            batches = [batch async for batch in results]
+
+        self.assertEqual(batches, [[(1,), (2,)], [(3,)]])
+        self.assertEqual(
+            cursor.afetchmany.await_args_list,
+            [mock.call(2), mock.call(2), mock.call(2)],
+        )
+        async_cursor.__aexit__.assert_awaited_once()
+
+    async def test_aexecute_sql_multi_empty_result_set(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+
+        with (
+            mock.patch.object(compiler, "as_sql", side_effect=EmptyResultSet),
+            mock.patch.object(connection, "acursor", create=True) as acursor,
+        ):
+            results = await compiler.aexecute_sql(MULTI)
+            batches = [batch async for batch in results]
+
+        self.assertEqual(batches, [])
+        acursor.assert_not_called()
+
+    async def test_aexecute_sql_multi_closes_partially_consumed_results(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchmany = mock.AsyncMock(return_value=[(1,)])
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ):
+            results = await compiler.aexecute_sql(
+                MULTI,
+                chunked_fetch=True,
+                chunk_size=1,
+            )
+            self.assertEqual(await anext(results), [(1,)])
+            await results.aclose()
+
+        async_cursor.__aexit__.assert_awaited_once()
 
     async def test_ahas_results_uses_async_execution(self):
         compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
