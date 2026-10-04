@@ -1,11 +1,12 @@
 import json
 import xml.etree.ElementTree
 from datetime import datetime
+from unittest import mock
 
 from asgiref.sync import async_to_sync, sync_to_async
 
 from django.db import NotSupportedError, connection
-from django.db.models import Prefetch, Sum
+from django.db.models import Prefetch, QuerySet, Sum
 from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
 from django.utils.deprecation import RemovedInDjango2029Warning
 
@@ -224,6 +225,66 @@ class AsyncQuerySetTest(TestCase):
 
         check = await SimpleModel.objects.filter(field=4).aexists()
         self.assertIs(check, False)
+
+    async def test_aexists_uses_sync_fallback_without_async_support(self):
+        queryset = SimpleModel.objects.filter(field=1)
+
+        with (
+            mock.patch.object(
+                connection.features,
+                "supports_async",
+                False,
+                create=True,
+            ),
+            mock.patch.object(queryset, "exists", return_value=True) as exists,
+        ):
+            result = await queryset.aexists()
+
+        self.assertIs(result, True)
+        exists.assert_called_once_with()
+
+    async def test_aexists_uses_native_async_query(self):
+        queryset = SimpleModel.objects.filter(field=1)
+
+        with (
+            mock.patch.object(
+                connection.features,
+                "supports_async",
+                True,
+                create=True,
+            ),
+            mock.patch.object(
+                queryset.query,
+                "ahas_results",
+                new=mock.AsyncMock(return_value=True),
+                create=True,
+            ) as ahas_results,
+        ):
+            result = await queryset.aexists()
+
+        self.assertIs(result, True)
+        ahas_results.assert_awaited_once_with(using=queryset.db)
+
+    async def test_aexists_preserves_custom_exists_override(self):
+        class CustomQuerySet(QuerySet):
+            exists_called = False
+
+            def exists(self):
+                self.exists_called = True
+                return False
+
+        queryset = CustomQuerySet(model=SimpleModel, using=connection.alias)
+
+        with mock.patch.object(
+            connection.features,
+            "supports_async",
+            True,
+            create=True,
+        ):
+            result = await queryset.aexists()
+
+        self.assertIs(result, False)
+        self.assertIs(queryset.exists_called, True)
 
     async def test_acontains(self):
         check = await SimpleModel.objects.acontains(self.s1)

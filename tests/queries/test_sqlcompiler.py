@@ -41,6 +41,22 @@ class SQLCompilerTest(TestCase):
         self.assertIsNone(exc.__cause__)
         self.assertTrue(exc.__suppress_context__)
 
+    async def test_ahas_results_preserves_custom_has_results_override(self):
+        class CustomCompiler(SQLCompiler):
+            has_results_called = False
+
+            def has_results(self):
+                self.has_results_called = True
+                return True
+
+        query = Query(Item)
+        compiler = CustomCompiler(query, connection, DEFAULT_DB_ALIAS)
+
+        result = await compiler.ahas_results()
+
+        self.assertIs(result, True)
+        self.assertIs(compiler.has_results_called, True)
+
     # RemovedInDjango2028Warning: When the deprecation ends, remove this
     # test.
     def test_quote_name_unless_alias_deprecation(self):
