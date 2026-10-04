@@ -851,11 +851,7 @@ class QuerySet(AltersData):
     async def acount(self):
         return await sync_to_async(self.count)()
 
-    def get(self, *args, **kwargs):
-        """
-        Perform the query and return a single object matching the given
-        keyword arguments.
-        """
+    def _get_query(self, args, kwargs):
         if self.query.combinator and (args or kwargs):
             raise NotSupportedError(
                 "Calling QuerySet.get(...) with filters after %s() is not "
@@ -871,7 +867,10 @@ class QuerySet(AltersData):
         ):
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
-        num = len(clone)
+        return clone, limit
+
+    def _get_result(self, clone, limit):
+        num = len(clone._result_cache)
         if num == 1:
             return clone._result_cache[0]
         if not num:
@@ -886,7 +885,23 @@ class QuerySet(AltersData):
             )
         )
 
+    def get(self, *args, **kwargs):
+        """
+        Perform the query and return a single object matching the given
+        keyword arguments.
+        """
+        clone, limit = self._get_query(args, kwargs)
+        clone._fetch_all()
+        return self._get_result(clone, limit)
+
     async def aget(self, *args, **kwargs):
+        if (
+            type(self).get is QuerySet.get
+            and connections[self.db].features.supports_async
+        ):
+            clone, limit = self._get_query(args, kwargs)
+            await clone._afetch_all()
+            return self._get_result(clone, limit)
         return await sync_to_async(self.get)(*args, **kwargs)
 
     def create(self, **kwargs):
@@ -1332,11 +1347,7 @@ class QuerySet(AltersData):
             )
         return params
 
-    def _earliest(self, *fields):
-        """
-        Return the earliest object according to fields (if given) or by the
-        model's Meta.get_latest_by.
-        """
+    def _earliest_queryset(self, fields):
         if fields:
             order_by = fields
         else:
@@ -1352,7 +1363,14 @@ class QuerySet(AltersData):
         obj.query.set_limits(high=1)
         obj.query.clear_ordering(force=True)
         obj.query.add_ordering(*order_by)
-        return obj.get()
+        return obj
+
+    def _earliest(self, *fields):
+        """
+        Return the earliest object according to fields (if given) or by the
+        model's Meta.get_latest_by.
+        """
+        return self._earliest_queryset(fields).get()
 
     def earliest(self, *fields):
         if self.query.is_sliced:
@@ -1360,6 +1378,13 @@ class QuerySet(AltersData):
         return self._earliest(*fields)
 
     async def aearliest(self, *fields):
+        if (
+            type(self).earliest is QuerySet.earliest
+            and connections[self.db].features.supports_async
+        ):
+            if self.query.is_sliced:
+                raise TypeError("Cannot change a query once a slice has been taken.")
+            return await self._earliest_queryset(fields).aget()
         return await sync_to_async(self.earliest)(*fields)
 
     def latest(self, *fields):
@@ -1372,6 +1397,13 @@ class QuerySet(AltersData):
         return self.reverse()._earliest(*fields)
 
     async def alatest(self, *fields):
+        if (
+            type(self).latest is QuerySet.latest
+            and connections[self.db].features.supports_async
+        ):
+            if self.query.is_sliced:
+                raise TypeError("Cannot change a query once a slice has been taken.")
+            return await self.reverse()._earliest_queryset(fields).aget()
         return await sync_to_async(self.latest)(*fields)
 
     def first(self):
@@ -1385,6 +1417,17 @@ class QuerySet(AltersData):
             return obj
 
     async def afirst(self):
+        if (
+            type(self).first is QuerySet.first
+            and connections[self.db].features.supports_async
+        ):
+            if self.ordered or not self.query.default_ordering:
+                queryset = self
+            else:
+                self._check_ordering_first_last_queryset_aggregation(method="first")
+                queryset = self.order_by("pk")
+            async for obj in queryset[:1].aiterator():
+                return obj
         return await sync_to_async(self.first)()
 
     def last(self):
@@ -1398,17 +1441,24 @@ class QuerySet(AltersData):
             return obj
 
     async def alast(self):
+        if (
+            type(self).last is QuerySet.last
+            and connections[self.db].features.supports_async
+        ):
+            if self.ordered or not self.query.default_ordering:
+                queryset = self.reverse()
+            else:
+                self._check_ordering_first_last_queryset_aggregation(method="last")
+                queryset = self.order_by("-pk")
+            async for obj in queryset[:1].aiterator():
+                return obj
         return await sync_to_async(self.last)()
 
-    def in_bulk(self, id_list=None, *, field_name="pk"):
-        """
-        Return a dictionary mapping each of the given IDs to the object with
-        that ID. If `id_list` isn't provided, evaluate the entire QuerySet.
-        """
+    def _in_bulk_setup(self, id_list, field_name):
         if self.query.is_sliced:
             raise TypeError("Cannot use 'limit' or 'offset' with in_bulk().")
         if id_list is not None and not id_list:
-            return {}
+            return None
         opts = self.model._meta
         unique_fields = [
             constraint.fields[0]
@@ -1487,6 +1537,8 @@ class QuerySet(AltersData):
                 f"in_bulk() cannot be used with {self._iterable_class.__name__}."
             )
 
+        filter_key = None
+        batches = None
         if id_list is not None:
             filter_key = "{}__in".format(field_name)
             id_list = tuple(id_list)
@@ -1494,18 +1546,56 @@ class QuerySet(AltersData):
             # If the database has a limit on the number of query parameters
             # (e.g. SQLite), retrieve objects in batches if necessary.
             if batch_size and batch_size < len(id_list):
-                results = ()
-                for offset in range(0, len(id_list), batch_size):
-                    batch = id_list[offset : offset + batch_size]
-                    results += tuple(qs.filter(**{filter_key: batch}))
-                qs = results
+                batches = tuple(
+                    id_list[offset : offset + batch_size]
+                    for offset in range(0, len(id_list), batch_size)
+                )
             else:
-                qs = qs.filter(**{filter_key: id_list})
+                batches = (id_list,)
+
+        return qs, get_key, get_obj, filter_key, batches
+
+    def in_bulk(self, id_list=None, *, field_name="pk"):
+        """
+        Return a dictionary mapping each of the given IDs to the object with
+        that ID. If `id_list` isn't provided, evaluate the entire QuerySet.
+        """
+        setup = self._in_bulk_setup(id_list, field_name)
+        if setup is None:
+            return {}
+
+        qs, get_key, get_obj, filter_key, batches = setup
+        if batches is None:
+            results = qs._chain()
         else:
-            qs = qs._chain()
-        return {get_key(obj): get_obj(obj) for obj in qs}
+            results = chain.from_iterable(
+                qs.filter(**{filter_key: batch}) for batch in batches
+            )
+        return {get_key(obj): get_obj(obj) for obj in results}
 
     async def ain_bulk(self, id_list=None, *, field_name="pk"):
+        if (
+            type(self).in_bulk is QuerySet.in_bulk
+            and connections[self.db].features.supports_async
+        ):
+            setup = self._in_bulk_setup(id_list, field_name)
+            if setup is None:
+                return {}
+
+            qs, get_key, get_obj, filter_key, batches = setup
+
+            async def results():
+                if batches is None:
+                    async for obj in qs.aiterator(chunk_size=2000):
+                        yield obj
+                else:
+                    for batch in batches:
+                        async for obj in qs.filter(
+                            **{filter_key: batch}
+                        ).aiterator(chunk_size=2000):
+                            yield obj
+
+            return {get_key(obj): get_obj(obj) async for obj in results()}
         return await sync_to_async(self.in_bulk)(
             id_list=id_list,
             field_name=field_name,
@@ -1670,6 +1760,28 @@ class QuerySet(AltersData):
         return self.filter(pk=obj.pk).exists()
 
     async def acontains(self, obj):
+        if (
+            type(self).contains is QuerySet.contains
+            and connections[self.db].features.supports_async
+        ):
+            self._not_support_combined_queries("contains")
+            if self._fields is not None:
+                raise TypeError(
+                    "Cannot call QuerySet.contains() after .values() or "
+                    ".values_list()."
+                )
+            try:
+                if obj._meta.concrete_model != self.model._meta.concrete_model:
+                    return False
+            except AttributeError:
+                raise TypeError("'obj' must be a model instance.")
+            if not obj._is_pk_set():
+                raise ValueError(
+                    "QuerySet.contains() cannot be used on unsaved objects."
+                )
+            if self._result_cache is not None:
+                return obj in self._result_cache
+            return await self.filter(pk=obj.pk).aexists()
         return await sync_to_async(self.contains)(obj=obj)
 
     def _prefetch_related_objects(self):
