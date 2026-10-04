@@ -403,6 +403,10 @@ class BaseDatabaseOperations:
         """
         return cursor.fetchall()
 
+    async def afetch_returned_rows(self, cursor, returning_params):
+        """Async equivalent of fetch_returned_rows()."""
+        return await cursor.afetchall()
+
     def compiler(self, compiler_name):
         """
         Return the SQLCompiler class corresponding to the given name,

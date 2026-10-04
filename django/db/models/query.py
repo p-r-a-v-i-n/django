@@ -921,11 +921,7 @@ class QuerySet(AltersData):
             return self._get_result(clone, limit)
         return await sync_to_async(self.get)(*args, **kwargs)
 
-    def create(self, **kwargs):
-        """
-        Create a new object with the given kwargs, saving it to the database
-        and returning the created object.
-        """
+    def _create_object(self, kwargs):
         reverse_one_to_one_fields = frozenset(kwargs).intersection(
             self.model._meta._reverse_one_to_one_field_names
         )
@@ -934,8 +930,14 @@ class QuerySet(AltersData):
                 "The following fields do not exist in this model: %s"
                 % ", ".join(reverse_one_to_one_fields)
             )
+        return self.model(**kwargs)
 
-        obj = self.model(**kwargs)
+    def create(self, **kwargs):
+        """
+        Create a new object with the given kwargs, saving it to the database
+        and returning the created object.
+        """
+        obj = self._create_object(kwargs)
         self._for_write = True
         obj.save(force_insert=True, using=self.db)
         obj._state.fetch_mode = self._fetch_mode
@@ -944,6 +946,15 @@ class QuerySet(AltersData):
     create.alters_data = True
 
     async def acreate(self, **kwargs):
+        if (
+            type(self).create is QuerySet.create
+            and connections[self.db].features.supports_async
+        ):
+            obj = self._create_object(kwargs)
+            self._for_write = True
+            await obj.asave(force_insert=True, using=self.db)
+            obj._state.fetch_mode = self._fetch_mode
+            return obj
         return await sync_to_async(self.create)(**kwargs)
 
     acreate.alters_data = True
@@ -1607,9 +1618,9 @@ class QuerySet(AltersData):
                         yield obj
                 else:
                     for batch in batches:
-                        async for obj in qs.filter(
-                            **{filter_key: batch}
-                        ).aiterator(chunk_size=2000):
+                        async for obj in qs.filter(**{filter_key: batch}).aiterator(
+                            chunk_size=2000
+                        ):
                             yield obj
 
             return {get_key(obj): get_obj(obj) async for obj in results()}
@@ -1750,6 +1761,21 @@ class QuerySet(AltersData):
     _update.alters_data = True
     _update.queryset_only = False
 
+    async def _aupdate(self, values, returning_fields=None):
+        if self.query.is_sliced:
+            raise TypeError("Cannot update a query once a slice has been taken.")
+        query = self.query.chain(sql.UpdateQuery)
+        query.add_update_fields(values)
+        query.annotations = {}
+        self._result_cache = None
+        compiler = query.get_compiler(self.db)
+        if returning_fields is None:
+            return await compiler.aexecute_sql(ROW_COUNT)
+        return await compiler.aexecute_returning_sql(returning_fields)
+
+    _aupdate.alters_data = True
+    _aupdate.queryset_only = False
+
     def exists(self):
         """
         Return True if the QuerySet would have any results, False otherwise.
@@ -1830,9 +1856,7 @@ class QuerySet(AltersData):
             type(self).explain is QuerySet.explain
             and connections[self.db].features.supports_async
         ):
-            return await self.query.aexplain(
-                using=self.db, format=format, **options
-            )
+            return await self.query.aexplain(using=self.db, format=format, **options)
         return await sync_to_async(self.explain)(format=format, **options)
 
     ##################################################
@@ -2490,6 +2514,32 @@ class QuerySet(AltersData):
 
     _insert.alters_data = True
     _insert.queryset_only = False
+
+    async def _ainsert(
+        self,
+        objs,
+        fields,
+        returning_fields=None,
+        raw=False,
+        using=None,
+        on_conflict=None,
+        update_fields=None,
+        unique_fields=None,
+    ):
+        self._for_write = True
+        if using is None:
+            using = self.db
+        query = sql.InsertQuery(
+            self.model,
+            on_conflict=on_conflict,
+            update_fields=update_fields,
+            unique_fields=unique_fields,
+        )
+        query.insert_values(fields, objs, raw=raw)
+        return await query.get_compiler(using=using).aexecute_sql(returning_fields)
+
+    _ainsert.alters_data = True
+    _ainsert.queryset_only = False
 
     def _batched_insert(
         self,

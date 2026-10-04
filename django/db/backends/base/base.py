@@ -319,6 +319,16 @@ class BaseDatabaseWrapper:
         """Create a cursor, opening a connection if necessary."""
         return self._cursor()
 
+    def acursor(self):
+        raise NotSupportedError(
+            "This database backend does not support native async cursors."
+        )
+
+    def atransaction(self):
+        raise NotSupportedError(
+            "This database backend does not support native async transactions."
+        )
+
     @async_unsafe
     def commit(self):
         """Commit a transaction and reset the dirty flag."""

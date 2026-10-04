@@ -2114,6 +2114,40 @@ class SQLInsertCompiler(SQLCompiler):
             rows = self.apply_converters(rows, converters)
         return list(rows)
 
+    async def aexecute_sql(self, returning_fields=None):
+        assert not (
+            returning_fields
+            and len(self.query.objs) != 1
+            and not self.connection.features.can_return_rows_from_bulk_insert
+        )
+        opts = self.query.get_meta()
+        self.returning_fields = returning_fields
+        cols = []
+        async with self.connection.acursor() as cursor:
+            for sql, params in self.as_sql():
+                await cursor.aexecute(sql, params)
+            if not self.returning_fields:
+                return []
+            obj_len = len(self.query.objs)
+            if (
+                self.connection.features.can_return_rows_from_bulk_insert
+                and obj_len > 1
+            ) or (
+                self.connection.features.can_return_columns_from_insert and obj_len == 1
+            ):
+                rows = await self.connection.ops.afetch_returned_rows(
+                    cursor, self.returning_params
+                )
+                cols = [field.get_col(opts.db_table) for field in self.returning_fields]
+            else:
+                raise NotSupportedError(
+                    "Native async inserts require database RETURNING support."
+                )
+        converters = self.get_converters(cols)
+        if converters:
+            rows = self.apply_converters(rows, converters)
+        return list(rows)
+
 
 class SQLDeleteCompiler(SQLCompiler):
     @cached_property
@@ -2277,6 +2311,20 @@ class SQLUpdateCompiler(SQLCompiler):
                 is_empty = False
         return row_count
 
+    async def aexecute_sql(self, result_type):
+        row_count = await super().aexecute_sql(result_type)
+        is_empty = row_count is None
+        row_count = row_count or 0
+
+        for query in self.query.get_related_updates():
+            aux_row_count = await query.get_compiler(self.using).aexecute_sql(
+                result_type
+            )
+            if is_empty and aux_row_count:
+                row_count = aux_row_count
+                is_empty = False
+        return row_count
+
     def execute_returning_sql(self, returning_fields):
         """
         Execute the specified update and return rows of the returned columns
@@ -2300,6 +2348,33 @@ class SQLUpdateCompiler(SQLCompiler):
             sql, params = self.as_sql()
             cursor.execute(sql, params)
             rows = self.connection.ops.fetch_returned_rows(
+                cursor, self.returning_params
+            )
+        opts = self.query.get_meta()
+        cols = [field.get_col(opts.db_table) for field in self.returning_fields]
+        converters = self.get_converters(cols)
+        if converters:
+            rows = self.apply_converters(rows, converters)
+        return list(rows)
+
+    async def aexecute_returning_sql(self, returning_fields):
+        if self.query.get_related_updates():
+            raise NotImplementedError(
+                "Update returning is not implemented for queries with related updates."
+            )
+
+        if (
+            not returning_fields
+            or not self.connection.features.can_return_rows_from_update
+        ):
+            row_count = await self.aexecute_sql(ROW_COUNT)
+            return [()] * row_count
+
+        self.returning_fields = returning_fields
+        async with self.connection.acursor() as cursor:
+            sql, params = self.as_sql()
+            await cursor.aexecute(sql, params)
+            rows = await self.connection.ops.afetch_returned_rows(
                 cursor, self.returning_params
             )
         opts = self.query.get_meta()
