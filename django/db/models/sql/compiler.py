@@ -1616,6 +1616,28 @@ class SQLCompiler:
         """
         return bool(self.execute_sql(SINGLE))
 
+    async def aexecute_sql(self, result_type):
+        """Run the query asynchronously and return a single row."""
+        if result_type != SINGLE:
+            raise NotImplementedError(
+                "Async query execution currently supports SINGLE results only."
+            )
+
+        try:
+            sql, params = self.as_sql()
+            if not sql:
+                raise EmptyResultSet
+        except EmptyResultSet:
+            return None
+
+        async with self.connection.acursor() as cursor:
+            await cursor.aexecute(sql, params)
+            result = await cursor.afetchone()
+
+        if result:
+            return result[0 : self.col_count]
+        return result
+
     def execute_sql(
         self, result_type=MULTI, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE
     ):

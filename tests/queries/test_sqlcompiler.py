@@ -1,9 +1,10 @@
 from unittest import mock
 
+from django.core.exceptions import EmptyResultSet
 from django.db import DEFAULT_DB_ALIAS, DatabaseError, connection
 from django.db.models.sql import Query
 from django.db.models.sql.compiler import SQLCompiler
-from django.db.models.sql.constants import SINGLE
+from django.db.models.sql.constants import MULTI, SINGLE
 from django.test import TestCase
 from django.utils.deprecation import RemovedInDjango2028Warning
 
@@ -48,7 +49,7 @@ class SQLCompilerTest(TestCase):
         sql, params = compiler.as_sql()
         cursor = mock.MagicMock()
         cursor.aexecute = mock.AsyncMock()
-        cursor.afetchone = mock.AsyncMock(return_value=(1,))
+        cursor.afetchone = mock.AsyncMock(return_value=(1, "extra column"))
         async_cursor = mock.MagicMock()
         async_cursor.__aenter__.return_value = cursor
 
@@ -64,6 +65,80 @@ class SQLCompilerTest(TestCase):
         acursor.assert_called_once_with()
         cursor.aexecute.assert_awaited_once_with(sql, params)
         cursor.afetchone.assert_awaited_once_with()
+        async_cursor.__aexit__.assert_awaited_once()
+
+    async def test_aexecute_sql_single_empty_result_set(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+
+        with (
+            mock.patch.object(compiler, "as_sql", side_effect=EmptyResultSet),
+            mock.patch.object(connection, "acursor", create=True) as acursor,
+        ):
+            result = await compiler.aexecute_sql(SINGLE)
+
+        self.assertIsNone(result)
+        acursor.assert_not_called()
+
+    async def test_aexecute_sql_single_no_row(self):
+        compiler = (
+            Query(Item)
+            .exists()
+            .get_compiler(
+                DEFAULT_DB_ALIAS,
+                connection,
+            )
+        )
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchone = mock.AsyncMock(return_value=None)
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ):
+            result = await compiler.aexecute_sql(SINGLE)
+
+        self.assertIsNone(result)
+
+    async def test_aexecute_sql_closes_cursor_context_after_error(self):
+        compiler = (
+            Query(Item)
+            .exists()
+            .get_compiler(
+                DEFAULT_DB_ALIAS,
+                connection,
+            )
+        )
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock(side_effect=DatabaseError("execute failed"))
+        cursor.afetchone = mock.AsyncMock()
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with (
+            mock.patch.object(
+                connection,
+                "acursor",
+                return_value=async_cursor,
+                create=True,
+            ),
+            self.assertRaisesMessage(DatabaseError, "execute failed"),
+        ):
+            await compiler.aexecute_sql(SINGLE)
+
+        cursor.afetchone.assert_not_awaited()
+        async_cursor.__aexit__.assert_awaited_once()
+
+    async def test_aexecute_sql_rejects_unsupported_result_type(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+        msg = "Async query execution currently supports SINGLE results only."
+
+        with self.assertRaisesMessage(NotImplementedError, msg):
+            await compiler.aexecute_sql(MULTI)
 
     async def test_ahas_results_preserves_custom_has_results_override(self):
         class CustomCompiler(SQLCompiler):
