@@ -4,7 +4,7 @@ from django.core.exceptions import EmptyResultSet
 from django.db import DEFAULT_DB_ALIAS, DatabaseError, connection
 from django.db.models.sql import Query
 from django.db.models.sql.compiler import SQLCompiler
-from django.db.models.sql.constants import MULTI, SINGLE
+from django.db.models.sql.constants import MULTI, NO_RESULTS, ROW_COUNT, SINGLE
 from django.test import TestCase
 from django.utils.deprecation import RemovedInDjango2028Warning
 
@@ -103,6 +103,45 @@ class SQLCompilerTest(TestCase):
             result = await compiler.aexecute_sql(SINGLE)
 
         self.assertIsNone(result)
+
+    async def test_aexecute_sql_returns_affected_row_count(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.rowcount = 3
+        cursor.afetchone = mock.AsyncMock()
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ):
+            result = await compiler.aexecute_sql(ROW_COUNT)
+
+        self.assertEqual(result, 3)
+        cursor.afetchone.assert_not_awaited()
+
+    async def test_aexecute_sql_supports_no_result(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchone = mock.AsyncMock()
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ):
+            result = await compiler.aexecute_sql(NO_RESULTS)
+
+        self.assertIsNone(result)
+        cursor.afetchone.assert_not_awaited()
 
     async def test_aexecute_sql_closes_cursor_context_after_error(self):
         compiler = (

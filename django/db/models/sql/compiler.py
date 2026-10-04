@@ -1682,10 +1682,9 @@ class SQLCompiler:
         chunk_size=GET_ITERATOR_CHUNK_SIZE,
     ):
         """Run the query asynchronously and return the requested results."""
-        if result_type not in (MULTI, SINGLE):
+        if result_type not in (MULTI, SINGLE, ROW_COUNT, NO_RESULTS):
             raise NotImplementedError(
-                "Async query execution currently supports MULTI and SINGLE results "
-                "only."
+                "Async query execution does not support the requested result type."
             )
 
         try:
@@ -1712,6 +1711,10 @@ class SQLCompiler:
 
         async with self.connection.acursor() as cursor:
             await cursor.aexecute(sql, params)
+            if result_type == ROW_COUNT:
+                return cursor.rowcount
+            if result_type == NO_RESULTS:
+                return None
             result = await cursor.afetchone()
 
         if result:
