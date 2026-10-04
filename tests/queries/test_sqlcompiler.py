@@ -3,6 +3,7 @@ from unittest import mock
 from django.db import DEFAULT_DB_ALIAS, DatabaseError, connection
 from django.db.models.sql import Query
 from django.db.models.sql.compiler import SQLCompiler
+from django.db.models.sql.constants import SINGLE
 from django.test import TestCase
 from django.utils.deprecation import RemovedInDjango2028Warning
 
@@ -40,6 +41,29 @@ class SQLCompilerTest(TestCase):
         self.assertIs(exc, execute_err)
         self.assertIsNone(exc.__cause__)
         self.assertTrue(exc.__suppress_context__)
+
+    async def test_aexecute_sql_single_uses_async_cursor(self):
+        query = Query(Item).exists()
+        compiler = query.get_compiler(DEFAULT_DB_ALIAS, connection)
+        sql, params = compiler.as_sql()
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchone = mock.AsyncMock(return_value=(1,))
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with mock.patch.object(
+            connection,
+            "acursor",
+            return_value=async_cursor,
+            create=True,
+        ) as acursor:
+            result = await compiler.aexecute_sql(SINGLE)
+
+        self.assertEqual(result, (1,))
+        acursor.assert_called_once_with()
+        cursor.aexecute.assert_awaited_once_with(sql, params)
+        cursor.afetchone.assert_awaited_once_with()
 
     async def test_ahas_results_preserves_custom_has_results_override(self):
         class CustomCompiler(SQLCompiler):
