@@ -116,31 +116,29 @@ class BaseIterable:
             if len(chunk) < self.chunk_size:
                 break
 
+    async def _async_native_generator(self):
+        async with aclosing(self._async_generator()) as iterator:
+            async for item in iterator:
+                yield item
+
     # __aiter__() is a *synchronous* method that has to then return an
     # *asynchronous* iterator/generator. Thus, nest an async generator inside
     # it.
-    # This is a generic iterable converter for now, and is going to suffer a
-    # performance penalty on large sets of items due to the cost of crossing
-    # over the sync barrier for each chunk. Custom __aiter__() methods should
-    # be added to each Iterable subclass, but that needs some work in the
-    # Compiler first.
+    # This remains the compatibility path for backends without async support
+    # and iterable classes without a native async implementation.
     def __aiter__(self):
+        if connections[self.queryset.db].features.supports_async:
+            return self._async_native_generator()
         return self._async_generator()
 
 
 class ModelIterable(BaseIterable):
     """Iterable that yields a model instance for each row."""
 
-    def __iter__(self):
+    def _get_model_from_row(self, compiler):
         queryset = self.queryset
         db = queryset.db
-        compiler = queryset.query.get_compiler(using=db)
         fetch_mode = queryset._fetch_mode
-        # Execute the query. This will also fill compiler.select, klass_info,
-        # and annotations.
-        results = compiler.execute_sql(
-            chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size
-        )
         select, klass_info, annotation_col_map = (
             compiler.select,
             compiler.klass_info,
@@ -174,7 +172,8 @@ class ModelIterable(BaseIterable):
             for field, related_objs in queryset._known_related_objects.items()
         ]
         peers = []
-        for row in compiler.results_iter(results):
+
+        def model_from_row(row):
             obj = from_db(
                 db,
                 init_list,
@@ -206,7 +205,40 @@ class ModelIterable(BaseIterable):
                 else:
                     setattr(obj, field.name, rel_obj)
 
-            yield obj
+            return obj
+
+        return model_from_row
+
+    def __iter__(self):
+        queryset = self.queryset
+        compiler = queryset.query.get_compiler(using=queryset.db)
+        # Execute the query. This will also fill compiler.select, klass_info,
+        # and annotations.
+        results = compiler.execute_sql(
+            chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size
+        )
+        model_from_row = self._get_model_from_row(compiler)
+        for row in compiler.results_iter(results):
+            yield model_from_row(row)
+
+    async def _async_native_generator(self):
+        if type(self).__iter__ is not ModelIterable.__iter__:
+            async with aclosing(self._async_generator()) as iterator:
+                async for item in iterator:
+                    yield item
+            return
+
+        queryset = self.queryset
+        compiler = queryset.query.get_compiler(using=queryset.db)
+        # Execute the query first so compiler.select, klass_info, and
+        # annotation_col_map are ready before model instances are created.
+        results = await compiler.aexecute_sql(
+            chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size
+        )
+        model_from_row = self._get_model_from_row(compiler)
+        async with aclosing(compiler.aresults_iter(results)) as rows:
+            async for row in rows:
+                yield model_from_row(row)
 
 
 class RawModelIterable(BaseIterable):
@@ -293,6 +325,33 @@ class ValuesIterable(BaseIterable):
         ):
             yield {names[i]: row[i] for i in indexes}
 
+    async def _async_native_generator(self):
+        if type(self).__iter__ is not ValuesIterable.__iter__:
+            async with aclosing(self._async_generator()) as iterator:
+                async for item in iterator:
+                    yield item
+            return
+
+        queryset = self.queryset
+        query = queryset.query
+        compiler = query.get_compiler(queryset.db)
+
+        if query.selected:
+            names = list(query.selected)
+        else:
+            names = [
+                *query.extra_select,
+                *query.values_select,
+                *query.annotation_select,
+            ]
+        indexes = range(len(names))
+        rows = compiler.aresults_iter(
+            chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size
+        )
+        async with aclosing(rows):
+            async for row in rows:
+                yield {names[i]: row[i] for i in indexes}
+
 
 class ValuesListIterable(BaseIterable):
     """
@@ -309,6 +368,29 @@ class ValuesListIterable(BaseIterable):
             chunked_fetch=self.chunked_fetch,
             chunk_size=self.chunk_size,
         )
+
+    async def _async_rows(self):
+        queryset = self.queryset
+        compiler = queryset.query.get_compiler(queryset.db)
+        rows = compiler.aresults_iter(
+            tuple_expected=True,
+            chunked_fetch=self.chunked_fetch,
+            chunk_size=self.chunk_size,
+        )
+        async with aclosing(rows):
+            async for row in rows:
+                yield row
+
+    async def _async_native_generator(self):
+        if type(self).__iter__ is not ValuesListIterable.__iter__:
+            async with aclosing(self._async_generator()) as iterator:
+                async for item in iterator:
+                    yield item
+            return
+
+        async with aclosing(self._async_rows()) as rows:
+            async for row in rows:
+                yield row
 
 
 class NamedValuesListIterable(ValuesListIterable):
@@ -333,6 +415,29 @@ class NamedValuesListIterable(ValuesListIterable):
         for row in super().__iter__():
             yield new(tuple_class, row)
 
+    async def _async_native_generator(self):
+        if type(self).__iter__ is not NamedValuesListIterable.__iter__:
+            async with aclosing(self._async_generator()) as iterator:
+                async for item in iterator:
+                    yield item
+            return
+
+        queryset = self.queryset
+        if queryset._fields:
+            names = queryset._fields
+        else:
+            query = queryset.query
+            names = [
+                *query.extra_select,
+                *query.values_select,
+                *query.annotation_select,
+            ]
+        tuple_class = create_namedtuple_class(*names)
+        new = tuple.__new__
+        async with aclosing(self._async_rows()) as rows:
+            async for row in rows:
+                yield new(tuple_class, row)
+
 
 class FlatValuesListIterable(BaseIterable):
     """
@@ -347,6 +452,22 @@ class FlatValuesListIterable(BaseIterable):
             chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size
         ):
             yield row[0]
+
+    async def _async_native_generator(self):
+        if type(self).__iter__ is not FlatValuesListIterable.__iter__:
+            async with aclosing(self._async_generator()) as iterator:
+                async for item in iterator:
+                    yield item
+            return
+
+        queryset = self.queryset
+        compiler = queryset.query.get_compiler(queryset.db)
+        rows = compiler.aresults_iter(
+            chunked_fetch=self.chunked_fetch, chunk_size=self.chunk_size
+        )
+        async with aclosing(rows):
+            async for row in rows:
+                yield row[0]
 
 
 class PreventQuerySetCloning:
@@ -487,7 +608,13 @@ class QuerySet(AltersData):
         # Remember, __aiter__ itself is synchronous, it's the thing it returns
         # that is async!
         async def generator():
-            await sync_to_async(self._fetch_all)()
+            if (
+                connections[self.db].features.supports_async
+                and type(self)._fetch_all is QuerySet._fetch_all
+            ):
+                await self._afetch_all()
+            else:
+                await sync_to_async(self._fetch_all)()
             for item in self._result_cache:
                 yield item
 
@@ -2335,6 +2462,15 @@ class QuerySet(AltersData):
             self._result_cache = list(self._iterable_class(self))
         if self._prefetch_related_lookups and not self._prefetch_done:
             self._prefetch_related_objects()
+
+    async def _afetch_all(self):
+        if self._result_cache is None:
+            self._result_cache = [item async for item in self._iterable_class(self)]
+        if self._prefetch_related_lookups and not self._prefetch_done:
+            await aprefetch_related_objects(
+                self._result_cache, *self._prefetch_related_lookups
+            )
+            self._prefetch_done = True
 
     def _next_is_sticky(self):
         """

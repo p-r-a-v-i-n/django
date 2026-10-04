@@ -78,8 +78,7 @@ class AsyncQuerySetTest(TestCase):
             ) as acursor,
         ):
             models = [
-                obj
-                async for obj in SimpleModel.objects.only("field").order_by("pk")
+                obj async for obj in SimpleModel.objects.only("field").order_by("pk")
             ]
             values = [
                 value
