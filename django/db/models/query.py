@@ -1802,6 +1802,17 @@ class QuerySet(AltersData):
 
     def delete(self):
         """Delete the records in the current QuerySet."""
+        del_query = self._delete_query()
+
+        collector = Collector(using=del_query.db, origin=self)
+        collector.collect(del_query)
+        num_deleted, num_deleted_per_model = collector.delete()
+
+        # Clear the result cache, in case this QuerySet gets reused.
+        self._result_cache = None
+        return num_deleted, num_deleted_per_model
+
+    def _delete_query(self):
         self._not_support_combined_queries("delete")
         if self.query.is_sliced:
             raise TypeError("Cannot use 'limit' or 'offset' with delete().")
@@ -1821,19 +1832,22 @@ class QuerySet(AltersData):
         del_query.query.select_for_update = False
         del_query.query.select_related = False
         del_query.query.clear_ordering(force=True)
-
-        collector = Collector(using=del_query.db, origin=self)
-        collector.collect(del_query)
-        num_deleted, num_deleted_per_model = collector.delete()
-
-        # Clear the result cache, in case this QuerySet gets reused.
-        self._result_cache = None
-        return num_deleted, num_deleted_per_model
+        return del_query
 
     delete.alters_data = True
     delete.queryset_only = True
 
     async def adelete(self):
+        if (
+            type(self).delete is QuerySet.delete
+            and connections[self.db].features.supports_async
+        ):
+            del_query = self._delete_query()
+            collector = Collector(using=del_query.db, origin=self)
+            await collector.acollect(del_query)
+            result = await collector.adelete()
+            self._result_cache = None
+            return result
         return await sync_to_async(self.delete)()
 
     adelete.alters_data = True
@@ -1849,6 +1863,13 @@ class QuerySet(AltersData):
         return query.get_compiler(using).execute_sql(ROW_COUNT)
 
     _raw_delete.alters_data = True
+
+    async def _araw_delete(self, using):
+        query = self.query.clone()
+        query.__class__ = sql.DeleteQuery
+        return await query.get_compiler(using).aexecute_sql(ROW_COUNT)
+
+    _araw_delete.alters_data = True
 
     def _update_query(self, kwargs):
         self._not_support_combined_queries("update")

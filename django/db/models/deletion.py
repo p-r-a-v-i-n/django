@@ -130,6 +130,9 @@ class Collector:
         # fast_deletes is a list of queryset-likes that can be deleted without
         # fetching the objects into memory.
         self.fast_deletes = []
+        # collect() calls made by an on_delete handler are queued while its
+        # async counterpart is running and awaited immediately afterwards.
+        self._async_collect_requests = None
 
         # Tracks deletion-order dependency for databases without transactions
         # or ability to defer constraint checks. Only concrete model classes
@@ -200,6 +203,16 @@ class Collector:
                     ]
                 )
             )
+            self.clear_restricted_objects_from_set(model, objs)
+
+    async def aclear_restricted_objects_from_queryset(self, model, qs):
+        if model in self.restricted_objects:
+            pks = [
+                obj.pk
+                for objs in self.restricted_objects[model].values()
+                for obj in objs
+            ]
+            objs = {obj async for obj in qs.filter(pk__in=pks)}
             self.clear_restricted_objects_from_set(model, objs)
 
     def _has_signal_listeners(self, model):
@@ -302,6 +315,22 @@ class Collector:
         may need to collect more objects to determine whether restricted ones
         can be deleted.
         """
+        if self._async_collect_requests is not None:
+            self._async_collect_requests.append(
+                (
+                    objs,
+                    {
+                        "source": source,
+                        "nullable": nullable,
+                        "collect_related": collect_related,
+                        "source_attr": source_attr,
+                        "reverse_dependency": reverse_dependency,
+                        "keep_parents": keep_parents,
+                        "fail_on_restricted": fail_on_restricted,
+                    },
+                )
+            )
+            return
         if self.can_fast_delete(objs):
             self.fast_deletes.append(objs)
             return
@@ -430,6 +459,153 @@ class Collector:
                         set(chain.from_iterable(restricted_objects.values())),
                     )
 
+    async def acollect(
+        self,
+        objs,
+        source=None,
+        nullable=False,
+        collect_related=True,
+        source_attr=None,
+        reverse_dependency=False,
+        keep_parents=False,
+        fail_on_restricted=True,
+    ):
+        """Async version of collect()."""
+        if self.can_fast_delete(objs):
+            self.fast_deletes.append(objs)
+            return
+        if isinstance(objs, models.QuerySet):
+            objs = [obj async for obj in objs]
+        else:
+            objs = list(objs)
+        new_objs = self.add(
+            objs, source, nullable, reverse_dependency=reverse_dependency
+        )
+        if not new_objs:
+            return
+
+        model = new_objs[0].__class__
+
+        if not keep_parents:
+            concrete_model = model._meta.concrete_model
+            for ptr in concrete_model._meta.parents.values():
+                if ptr:
+                    parent_objs = [getattr(obj, ptr.name) for obj in new_objs]
+                    await self.acollect(
+                        parent_objs,
+                        source=model,
+                        source_attr=ptr.remote_field.related_name,
+                        collect_related=False,
+                        reverse_dependency=True,
+                        fail_on_restricted=False,
+                    )
+        if not collect_related:
+            return
+
+        model_fast_deletes = defaultdict(list)
+        protected_objects = defaultdict(list)
+        for related in get_candidate_relations_to_delete(model._meta):
+            if (
+                keep_parents
+                and related.model._meta.concrete_model in model._meta.all_parents
+            ):
+                continue
+            field = related.field
+            on_delete = field.remote_field.on_delete
+            if on_delete in SKIP_COLLECTION:
+                if self.force_collection and (
+                    forced_on_delete := getattr(on_delete, "forced_collector", None)
+                ):
+                    on_delete = forced_on_delete
+                else:
+                    continue
+            related_model = related.related_model
+            if self.can_fast_delete(related_model, from_field=field):
+                model_fast_deletes[related_model].append(field)
+                continue
+            batches = self.get_del_batches(new_objs, [field])
+            for batch in batches:
+                sub_objs = self.related_objects(related_model, [field], batch)
+                if not (
+                    sub_objs.query.select_related
+                    or self._has_signal_listeners(related_model)
+                ):
+                    referenced_fields = set(
+                        chain.from_iterable(
+                            (rf.attname for rf in rel.field.foreign_related_fields)
+                            for rel in get_candidate_relations_to_delete(
+                                related_model._meta
+                            )
+                        )
+                    )
+                    sub_objs = sub_objs.only(*tuple(referenced_fields))
+                if not getattr(on_delete, "lazy_sub_objs", False):
+                    sub_objs = [obj async for obj in sub_objs]
+                    if not sub_objs:
+                        continue
+
+                pending_collections = []
+                previous_pending = self._async_collect_requests
+                self._async_collect_requests = pending_collections
+                try:
+                    on_delete(self, field, sub_objs, self.using)
+                except ProtectedError as error:
+                    key = "'%s.%s'" % (field.model.__name__, field.name)
+                    protected_objects[key] += error.protected_objects
+                finally:
+                    self._async_collect_requests = previous_pending
+                for pending_objs, pending_kwargs in pending_collections:
+                    try:
+                        await self.acollect(pending_objs, **pending_kwargs)
+                    except ProtectedError as error:
+                        key = "'%s.%s'" % (field.model.__name__, field.name)
+                        protected_objects[key] += error.protected_objects
+        if protected_objects:
+            raise ProtectedError(
+                "Cannot delete some instances of model %r because they are "
+                "referenced through protected foreign keys: %s."
+                % (
+                    model.__name__,
+                    ", ".join(protected_objects),
+                ),
+                set(chain.from_iterable(protected_objects.values())),
+            )
+        for related_model, related_fields in model_fast_deletes.items():
+            batches = self.get_del_batches(new_objs, related_fields)
+            for batch in batches:
+                sub_objs = self.related_objects(related_model, related_fields, batch)
+                self.fast_deletes.append(sub_objs)
+        for field in model._meta.private_fields:
+            if hasattr(field, "bulk_related_objects"):
+                sub_objs = field.bulk_related_objects(new_objs, self.using)
+                await self.acollect(
+                    sub_objs, source=model, nullable=True, fail_on_restricted=False
+                )
+
+        if fail_on_restricted:
+            for related_model, instances in self.data.items():
+                self.clear_restricted_objects_from_set(related_model, instances)
+            for qs in self.fast_deletes:
+                await self.aclear_restricted_objects_from_queryset(qs.model, qs)
+            if self.restricted_objects.values():
+                restricted_objects = defaultdict(list)
+                for related_model, fields in self.restricted_objects.items():
+                    for field, restricted_objs in fields.items():
+                        if restricted_objs:
+                            key = "'%s.%s'" % (related_model.__name__, field.name)
+                            restricted_objects[key] += restricted_objs
+                if restricted_objects:
+                    raise RestrictedError(
+                        "Cannot delete some instances of model %r because "
+                        "they are referenced through restricted foreign keys: "
+                        "%s."
+                        % (
+                            model.__name__,
+                            ", ".join(restricted_objects),
+                        ),
+                        set(chain.from_iterable(restricted_objects.values())),
+                    )
+
     def related_objects(self, related_model, related_fields, objs):
         """
         Get a QuerySet of the related model to objs via related fields.
@@ -540,6 +716,77 @@ class Collector:
                 if not model._meta.auto_created:
                     for obj in instances:
                         signals.post_delete.send(
+                            sender=model,
+                            instance=obj,
+                            using=self.using,
+                            origin=self.origin,
+                        )
+
+        for model, instances in self.data.items():
+            for instance in instances:
+                setattr(instance, model._meta.pk.attname, None)
+        return sum(deleted_counter.values()), dict(deleted_counter)
+
+    async def adelete(self):
+        """Async version of delete()."""
+        for model, instances in self.data.items():
+            self.data[model] = sorted(instances, key=attrgetter("pk"))
+
+        self.sort()
+        deleted_counter = Counter()
+        connection = connections[self.using]
+
+        async with connection.atransaction():
+            for model, obj in self.instances_with_model():
+                if not model._meta.auto_created:
+                    await signals.pre_delete.asend(
+                        sender=model,
+                        instance=obj,
+                        using=self.using,
+                        origin=self.origin,
+                    )
+
+            for qs in self.fast_deletes:
+                count = await qs._araw_delete(using=self.using)
+                if count:
+                    deleted_counter[qs.model._meta.label] += count
+
+            for (field, value), instances_list in self.field_updates.items():
+                updates = []
+                objs = []
+                for instances in instances_list:
+                    if (
+                        isinstance(instances, models.QuerySet)
+                        and instances._result_cache is None
+                    ):
+                        updates.append(instances)
+                    else:
+                        objs.extend(instances)
+                if updates:
+                    combined_updates = reduce(or_, updates)
+                    await combined_updates.aupdate(**{field.name: value})
+                if objs:
+                    model = objs[0].__class__
+                    query = sql.UpdateQuery(model)
+                    await query.aupdate_batch(
+                        list({obj.pk for obj in objs}),
+                        {field.name: value},
+                        self.using,
+                    )
+
+            for instances in self.data.values():
+                instances.reverse()
+
+            for model, instances in self.data.items():
+                query = sql.DeleteQuery(model)
+                pk_list = [obj.pk for obj in instances]
+                count = await query.adelete_batch(pk_list, self.using)
+                if count:
+                    deleted_counter[model._meta.label] += count
+
+                if not model._meta.auto_created:
+                    for obj in instances:
+                        await signals.post_delete.asend(
                             sender=model,
                             instance=obj,
                             using=self.using,
