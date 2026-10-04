@@ -140,6 +140,19 @@ class SQLCompilerTest(TestCase):
         with self.assertRaisesMessage(NotImplementedError, msg):
             await compiler.aexecute_sql(MULTI)
 
+    async def test_ahas_results_uses_async_execution(self):
+        compiler = SQLCompiler(Query(Item), connection, DEFAULT_DB_ALIAS)
+
+        with mock.patch.object(
+            compiler,
+            "aexecute_sql",
+            new=mock.AsyncMock(return_value=(1,)),
+        ) as aexecute_sql:
+            result = await compiler.ahas_results()
+
+        self.assertIs(result, True)
+        aexecute_sql.assert_awaited_once_with(SINGLE)
+
     async def test_ahas_results_preserves_custom_has_results_override(self):
         class CustomCompiler(SQLCompiler):
             has_results_called = False
