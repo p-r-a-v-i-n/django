@@ -5,6 +5,8 @@ import warnings
 from functools import partial
 from itertools import chain
 
+from asgiref.sync import sync_to_async
+
 from django.core.exceptions import EmptyResultSet, FieldError, FullResultSet
 from django.db import DatabaseError, NotSupportedError
 from django.db.models.constants import LOOKUP_SEP
@@ -1615,6 +1617,12 @@ class SQLCompiler:
         versions of "query has any results."
         """
         return bool(self.execute_sql(SINGLE))
+
+    async def ahas_results(self):
+        """Return whether the query has results using async execution."""
+        if type(self).has_results is not SQLCompiler.has_results:
+            return await sync_to_async(self.has_results)()
+        return bool(await self.aexecute_sql(SINGLE))
 
     async def aexecute_sql(self, result_type):
         """Run the query asynchronously and return a single row."""
