@@ -1624,11 +1624,38 @@ class SQLCompiler:
             return await sync_to_async(self.has_results)()
         return bool(await self.aexecute_sql(SINGLE))
 
-    async def aexecute_sql(self, result_type):
-        """Run the query asynchronously and return a single row."""
-        if result_type != SINGLE:
+    async def _aiter_execute_sql(
+        self,
+        sql,
+        params,
+        chunked_fetch,
+        chunk_size,
+    ):
+        if sql is None:
+            return
+
+        async with self.connection.acursor() as cursor:
+            await cursor.aexecute(sql, params)
+            if not chunked_fetch or not self.connection.features.can_use_chunked_reads:
+                rows = await cursor.afetchall()
+                if rows:
+                    yield rows
+                return
+
+            while rows := await cursor.afetchmany(chunk_size):
+                yield rows
+
+    async def aexecute_sql(
+        self,
+        result_type=MULTI,
+        chunked_fetch=False,
+        chunk_size=GET_ITERATOR_CHUNK_SIZE,
+    ):
+        """Run the query asynchronously and return the requested results."""
+        if result_type not in (MULTI, SINGLE):
             raise NotImplementedError(
-                "Async query execution currently supports SINGLE results only."
+                "Async query execution currently supports MULTI and SINGLE results "
+                "only."
             )
 
         try:
@@ -1636,7 +1663,22 @@ class SQLCompiler:
             if not sql:
                 raise EmptyResultSet
         except EmptyResultSet:
+            if result_type == MULTI:
+                return self._aiter_execute_sql(
+                    None,
+                    None,
+                    chunked_fetch,
+                    chunk_size,
+                )
             return None
+
+        if result_type == MULTI:
+            return self._aiter_execute_sql(
+                sql,
+                params,
+                chunked_fetch,
+                chunk_size,
+            )
 
         async with self.connection.acursor() as cursor:
             await cursor.aexecute(sql, params)
