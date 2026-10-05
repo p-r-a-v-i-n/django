@@ -329,6 +329,10 @@ class BaseDatabaseWrapper:
             "This database backend does not support native async transactions."
         )
 
+    def get_async_autocommit(self):
+        """Return whether native async queries are outside a transaction."""
+        return True
+
     @async_unsafe
     def commit(self):
         """Commit a transaction and reset the dirty flag."""

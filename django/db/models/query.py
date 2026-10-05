@@ -1455,6 +1455,25 @@ class QuerySet(AltersData):
     get_or_create.alters_data = True
 
     async def aget_or_create(self, defaults=None, **kwargs):
+        if (
+            type(self).get_or_create is QuerySet.get_or_create
+            and connections[self.db].features.supports_async
+        ):
+            self._for_write = True
+            try:
+                return await self.aget(**kwargs), False
+            except self.model.DoesNotExist:
+                params = self._extract_model_params(defaults, **kwargs)
+                try:
+                    async with connections[self.db].atransaction():
+                        params = dict(resolve_callables(params))
+                        return await self.acreate(**params), True
+                except IntegrityError:
+                    try:
+                        return await self.aget(**kwargs), False
+                    except self.model.DoesNotExist:
+                        pass
+                    raise
         return await sync_to_async(self.get_or_create)(
             defaults=defaults,
             **kwargs,
@@ -1511,6 +1530,40 @@ class QuerySet(AltersData):
     update_or_create.alters_data = True
 
     async def aupdate_or_create(self, defaults=None, create_defaults=None, **kwargs):
+        if (
+            type(self).update_or_create is QuerySet.update_or_create
+            and connections[self.db].features.supports_async
+        ):
+            update_defaults = defaults or {}
+            if create_defaults is None:
+                create_defaults = update_defaults
+
+            self._for_write = True
+            async with connections[self.db].atransaction():
+                obj, created = await self.select_for_update().aget_or_create(
+                    create_defaults, **kwargs
+                )
+                if created:
+                    return obj, created
+                for key, value in resolve_callables(update_defaults):
+                    setattr(obj, key, value)
+
+                update_fields = set(update_defaults)
+                concrete_field_names = self.model._meta._non_pk_concrete_field_names
+                if concrete_field_names.issuperset(update_fields):
+                    pk_fields = self.model._meta.pk_fields
+                    for field in self.model._meta.local_concrete_fields:
+                        if not (
+                            field in pk_fields
+                            or field.__class__.pre_save is Field.pre_save
+                        ):
+                            update_fields.add(field.name)
+                            if field.name != field.attname:
+                                update_fields.add(field.attname)
+                    await obj.asave(using=self.db, update_fields=update_fields)
+                else:
+                    await obj.asave(using=self.db)
+            return obj, False
         return await sync_to_async(self.update_or_create)(
             defaults=defaults,
             create_defaults=create_defaults,

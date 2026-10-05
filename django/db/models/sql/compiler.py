@@ -862,7 +862,11 @@ class SQLCompiler:
 
                 if self.query.select_for_update and features.has_select_for_update:
                     if (
-                        self.connection.get_autocommit()
+                        (
+                            self.connection.get_async_autocommit()
+                            if getattr(self, "_async_execution", False)
+                            else self.connection.get_autocommit()
+                        )
                         # Don't raise an exception when database doesn't
                         # support transactions, as it's a noop.
                         and features.supports_transactions
@@ -1688,7 +1692,11 @@ class SQLCompiler:
             )
 
         try:
-            sql, params = self.as_sql()
+            self._async_execution = True
+            try:
+                sql, params = self.as_sql()
+            finally:
+                self._async_execution = False
             if not sql:
                 raise EmptyResultSet
         except EmptyResultSet:
