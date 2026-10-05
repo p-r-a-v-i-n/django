@@ -1,12 +1,13 @@
 import sys
 import threading
 import time
-from unittest import skipIf, skipUnless
+from unittest import mock, skipIf, skipUnless
 
 from django.db import (
     DatabaseError,
     Error,
     IntegrityError,
+    NotSupportedError,
     OperationalError,
     connection,
     transaction,
@@ -598,3 +599,145 @@ class SavepointTests(SimpleTestCase):
         msg = "savepoint() is deprecated. Use savepoint_create() instead."
         with self.assertRaisesMessage(RemovedInDjango2028Warning, msg):
             transaction.savepoint()
+
+
+class AsyncAtomicTests(SimpleTestCase):
+    databases = {"default"}
+
+    def async_transaction_context(self):
+        context = mock.MagicMock()
+        context.__aenter__ = mock.AsyncMock()
+        context.__aexit__ = mock.AsyncMock(return_value=False)
+        return context
+
+    async def test_context_manager_forwards_options(self):
+        db_connection = transaction.get_connection()
+        context = self.async_transaction_context()
+
+        with (
+            mock.patch.object(db_connection.features, "supports_async", True),
+            mock.patch.object(
+                db_connection,
+                "atransaction",
+                return_value=context,
+            ) as atransaction,
+        ):
+            async with transaction.atomic(
+                savepoint=False,
+                isolation_level="serializable",
+                read_only=True,
+                deferrable=True,
+            ):
+                pass
+
+        atransaction.assert_called_once_with(
+            savepoint=False,
+            isolation_level="serializable",
+            read_only=True,
+            deferrable=True,
+        )
+        context.__aenter__.assert_awaited_once_with()
+        context.__aexit__.assert_awaited_once_with(None, None, None)
+
+    async def test_decorator(self):
+        db_connection = transaction.get_connection()
+        context = self.async_transaction_context()
+
+        @transaction.atomic
+        async def operation(value):
+            return value
+
+        with (
+            mock.patch.object(db_connection.features, "supports_async", True),
+            mock.patch.object(
+                db_connection,
+                "atransaction",
+                return_value=context,
+            ),
+        ):
+            result = await operation("result")
+
+        self.assertEqual(result, "result")
+        context.__aenter__.assert_awaited_once_with()
+        context.__aexit__.assert_awaited_once_with(None, None, None)
+
+    async def test_exception_is_forwarded_to_backend_context(self):
+        db_connection = transaction.get_connection()
+        context = self.async_transaction_context()
+        error = ValueError("rollback")
+
+        with (
+            mock.patch.object(db_connection.features, "supports_async", True),
+            mock.patch.object(
+                db_connection,
+                "atransaction",
+                return_value=context,
+            ),
+            self.assertRaisesMessage(ValueError, "rollback"),
+        ):
+            async with transaction.atomic():
+                raise error
+
+        exit_args = context.__aexit__.await_args.args
+        self.assertIs(exit_args[0], ValueError)
+        self.assertIs(exit_args[1], error)
+        self.assertIsNotNone(exit_args[2])
+
+    async def test_reentrant_context_manager(self):
+        db_connection = transaction.get_connection()
+        outer_context = self.async_transaction_context()
+        inner_context = self.async_transaction_context()
+        atomic = transaction.atomic()
+
+        with (
+            mock.patch.object(db_connection.features, "supports_async", True),
+            mock.patch.object(
+                db_connection,
+                "atransaction",
+                side_effect=[outer_context, inner_context],
+            ) as atransaction,
+        ):
+            async with atomic:
+                async with atomic:
+                    pass
+
+        self.assertEqual(atransaction.call_count, 2)
+        outer_context.__aexit__.assert_awaited_once_with(None, None, None)
+        inner_context.__aexit__.assert_awaited_once_with(None, None, None)
+
+    async def test_nested_durable_block_is_rejected(self):
+        db_connection = transaction.get_connection()
+        context = self.async_transaction_context()
+        msg = "A durable atomic block cannot be nested within another atomic block."
+
+        with (
+            mock.patch.object(db_connection.features, "supports_async", True),
+            mock.patch.object(
+                db_connection,
+                "atransaction",
+                return_value=context,
+            ) as atransaction,
+        ):
+            async with transaction.atomic():
+                with self.assertRaisesMessage(RuntimeError, msg):
+                    async with transaction.atomic(durable=True):
+                        pass
+
+        atransaction.assert_called_once_with()
+
+    async def test_unsupported_backend(self):
+        db_connection = transaction.get_connection()
+        msg = "does not support native async transactions"
+
+        with (
+            mock.patch.object(db_connection.features, "supports_async", False),
+            self.assertRaisesMessage(NotSupportedError, msg),
+        ):
+            async with transaction.atomic():
+                pass
+
+    def test_sync_transaction_options_are_rejected(self):
+        msg = "Transaction options require a native async atomic block."
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            with transaction.atomic(isolation_level="serializable"):
+                pass

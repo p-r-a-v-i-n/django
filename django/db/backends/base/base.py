@@ -324,7 +324,14 @@ class BaseDatabaseWrapper:
             "This database backend does not support native async cursors."
         )
 
-    def atransaction(self):
+    def atransaction(
+        self,
+        *,
+        savepoint=True,
+        isolation_level=None,
+        read_only=None,
+        deferrable=None,
+    ):
         raise NotSupportedError(
             "This database backend does not support native async transactions."
         )

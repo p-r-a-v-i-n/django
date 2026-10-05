@@ -1,16 +1,21 @@
 import warnings
 from contextlib import ContextDecorator, contextmanager
+from contextvars import ContextVar
 from functools import wraps
+from inspect import iscoroutinefunction
 
 from django.db import (
     DEFAULT_DB_ALIAS,
     DatabaseError,
     Error,
+    NotSupportedError,
     ProgrammingError,
     connections,
 )
 from django.utils.deprecation import RemovedInDjango2028Warning
 from django.utils.warnings import django_file_prefixes
+
+_async_atomic_blocks = ContextVar("django_async_atomic_blocks", default={})
 
 
 class TransactionManagementError(ProgrammingError):
@@ -186,13 +191,45 @@ class Atomic(ContextDecorator):
     This is a private API.
     """
 
-    def __init__(self, using, savepoint, durable):
+    def __init__(
+        self,
+        using,
+        savepoint,
+        durable,
+        isolation_level=None,
+        read_only=None,
+        deferrable=None,
+    ):
         self.using = using
         self.savepoint = savepoint
         self.durable = durable
+        self.isolation_level = isolation_level
+        self.read_only = read_only
+        self.deferrable = deferrable
         self._from_testcase = False
+        self._async_contexts = ContextVar(
+            f"django_async_atomic_contexts_{id(self)}", default=()
+        )
+
+    def __call__(self, func):
+        if iscoroutinefunction(func):
+
+            @wraps(func)
+            async def inner(*args, **kwargs):
+                async with self._recreate_cm():
+                    return await func(*args, **kwargs)
+
+            return inner
+        return super().__call__(func)
 
     def __enter__(self):
+        if any(
+            option is not None
+            for option in (self.isolation_level, self.read_only, self.deferrable)
+        ):
+            raise NotSupportedError(
+                "Transaction options require a native async atomic block."
+            )
         connection = get_connection(self.using)
 
         if (
@@ -325,15 +362,82 @@ class Atomic(ContextDecorator):
                 else:
                     connection.in_atomic_block = False
 
+    async def __aenter__(self):
+        connection = get_connection(self.using)
+        if not connection.features.supports_async:
+            raise NotSupportedError(
+                "This database backend does not support native async transactions."
+            )
 
-def atomic(using=None, savepoint=True, durable=False):
+        blocks_by_alias = _async_atomic_blocks.get()
+        blocks = blocks_by_alias.get(connection.alias, ())
+        if self.durable and blocks and not blocks[-1]._from_testcase:
+            raise RuntimeError(
+                "A durable atomic block cannot be nested within another atomic block."
+            )
+
+        transaction_options = {}
+        if not self.savepoint:
+            transaction_options["savepoint"] = False
+        if self.isolation_level is not None:
+            transaction_options["isolation_level"] = self.isolation_level
+        if self.read_only is not None:
+            transaction_options["read_only"] = self.read_only
+        if self.deferrable is not None:
+            transaction_options["deferrable"] = self.deferrable
+
+        context = connection.atransaction(**transaction_options)
+        await context.__aenter__()
+
+        updated_blocks = blocks_by_alias.copy()
+        updated_blocks[connection.alias] = (*blocks, self)
+        blocks_token = _async_atomic_blocks.set(updated_blocks)
+        contexts = self._async_contexts.get()
+        self._async_contexts.set((*contexts, (context, blocks_token)))
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        contexts = self._async_contexts.get()
+        if not contexts:
+            raise RuntimeError("Async atomic block is not active.")
+
+        context, blocks_token = contexts[-1]
+        try:
+            return await context.__aexit__(exc_type, exc_value, traceback)
+        finally:
+            self._async_contexts.set(contexts[:-1])
+            _async_atomic_blocks.reset(blocks_token)
+
+
+def atomic(
+    using=None,
+    savepoint=True,
+    durable=False,
+    *,
+    isolation_level=None,
+    read_only=None,
+    deferrable=None,
+):
     # Bare decorator: @atomic -- although the first argument is called
     # `using`, it's actually the function being decorated.
     if callable(using):
-        return Atomic(DEFAULT_DB_ALIAS, savepoint, durable)(using)
+        return Atomic(
+            DEFAULT_DB_ALIAS,
+            savepoint,
+            durable,
+            isolation_level,
+            read_only,
+            deferrable,
+        )(using)
     # Decorator: @atomic(...) or context manager: with atomic(...): ...
     else:
-        return Atomic(using, savepoint, durable)
+        return Atomic(
+            using,
+            savepoint,
+            durable,
+            isolation_level,
+            read_only,
+            deferrable,
+        )
 
 
 def _non_atomic_requests(view, using):
