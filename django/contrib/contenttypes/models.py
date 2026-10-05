@@ -60,6 +60,24 @@ class ContentTypeManager(models.Manager):
         self._add_to_cache(self.db, ct)
         return ct
 
+    async def aget_for_model(self, model, for_concrete_model=True):
+        """Async version of get_for_model()."""
+        opts = self._get_opts(model, for_concrete_model)
+        try:
+            return self._get_from_cache(opts)
+        except KeyError:
+            pass
+
+        try:
+            ct = await self.aget(app_label=opts.app_label, model=opts.model_name)
+        except self.model.DoesNotExist:
+            ct, created = await self.aget_or_create(
+                app_label=opts.app_label,
+                model=opts.model_name,
+            )
+        self._add_to_cache(self.db, ct)
+        return ct
+
     def get_for_models(self, *models, for_concrete_models=True):
         """
         Given *models, return a dictionary mapping {model: content_type}.
@@ -101,6 +119,40 @@ class ContentTypeManager(models.Manager):
                 results[model] = ct
         return results
 
+    async def aget_for_models(self, *models, for_concrete_models=True):
+        """Async version of get_for_models()."""
+        results = {}
+        needed_models = defaultdict(set)
+        needed_opts = defaultdict(list)
+        for model in models:
+            opts = self._get_opts(model, for_concrete_models)
+            try:
+                ct = self._get_from_cache(opts)
+            except KeyError:
+                needed_models[opts.app_label].add(opts.model_name)
+                needed_opts[(opts.app_label, opts.model_name)].append(model)
+            else:
+                results[model] = ct
+        if needed_opts:
+            condition = Q(
+                *(
+                    Q(("app_label", app_label), ("model__in", model_names))
+                    for app_label, model_names in needed_models.items()
+                ),
+                _connector=Q.OR,
+            )
+            async for ct in self.filter(condition):
+                opts_models = needed_opts.pop((ct.app_label, ct.model), [])
+                for model in opts_models:
+                    results[model] = ct
+                self._add_to_cache(self.db, ct)
+        for (app_label, model_name), opts_models in needed_opts.items():
+            ct = await self.acreate(app_label=app_label, model=model_name)
+            self._add_to_cache(self.db, ct)
+            for model in opts_models:
+                results[model] = ct
+        return results
+
     def get_for_id(self, id):
         """
         Lookup a ContentType by ID. Use the same shared cache as get_for_model
@@ -112,6 +164,15 @@ class ContentTypeManager(models.Manager):
             # This could raise a DoesNotExist; that's correct behavior and will
             # make sure that only correct ctypes get stored in the cache dict.
             ct = self.get(pk=id)
+            self._add_to_cache(self.db, ct)
+        return ct
+
+    async def aget_for_id(self, id):
+        """Async version of get_for_id()."""
+        try:
+            ct = self._cache[self.db][id]
+        except KeyError:
+            ct = await self.aget(pk=id)
             self._add_to_cache(self.db, ct)
         return ct
 

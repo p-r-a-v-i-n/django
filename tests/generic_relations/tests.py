@@ -51,6 +51,16 @@ class GenericRelationsTests(TestCase):
         await self.bacon.tags.acreate(tag="orange")
         self.assertEqual(await self.bacon.tags.acount(), 3)
 
+    def test_related_manager_access_does_not_query_content_type(self):
+        ContentType.objects.clear_cache()
+
+        with self.assertNumQueries(0):
+            manager = self.bacon.tags
+            queryset = manager.all()
+
+        self.assertIs(manager.instance, self.bacon)
+        self.assertIs(queryset.model, TaggedItem)
+
     def test_generic_update_or_create_when_created(self):
         """
         Should be able to use update_or_create from the generic related manager

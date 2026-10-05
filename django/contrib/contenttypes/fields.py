@@ -7,7 +7,7 @@ from asgiref.sync import sync_to_async
 from django.contrib.contenttypes.models import ContentType
 from django.core import checks
 from django.core.exceptions import FieldDoesNotExist, ObjectDoesNotExist
-from django.db import DEFAULT_DB_ALIAS, models, router, transaction
+from django.db import DEFAULT_DB_ALIAS, connections, models, router, transaction
 from django.db.models import DO_NOTHING, ForeignObject, ForeignObjectRel
 from django.db.models.base import ModelBase, make_foreign_order_accessors
 from django.db.models.deletion import DatabaseOnDelete
@@ -17,7 +17,7 @@ from django.db.models.fields.related import (
     ReverseManyToOneDescriptor,
     lazy_related_operation,
 )
-from django.db.models.query import prefetch_related_objects
+from django.db.models.query import QuerySet, prefetch_related_objects
 from django.db.models.query_utils import PathInfo
 from django.db.models.sql import AND
 from django.db.models.sql.where import WhereNode
@@ -172,6 +172,19 @@ class GenericForeignKey(FieldCacheMixin, Field):
             # This should never happen. I love comments like this, don't you?
             raise Exception("Impossible arguments to GFK.get_content_type!")
 
+    async def aget_content_type(self, obj=None, id=None, using=None, model=None):
+        if obj is not None:
+            return await ContentType.objects.db_manager(obj._state.db).aget_for_model(
+                obj, for_concrete_model=self.for_concrete_model
+            )
+        elif id is not None:
+            return await ContentType.objects.db_manager(using).aget_for_id(id)
+        elif model is not None:
+            return await ContentType.objects.db_manager(using).aget_for_model(
+                model, for_concrete_model=self.for_concrete_model
+            )
+        raise Exception("Impossible arguments to GFK.aget_content_type!")
+
 
 class GenericForeignKeyDescriptor:
     def __init__(self, field):
@@ -232,6 +245,65 @@ class GenericForeignKeyDescriptor:
                     id=ct_id, using=obj._state.db
                 ).model_class()
                 return str(getattr(obj, self.field.fk_field)), model
+
+        return (
+            ret_val,
+            lambda obj: (obj._meta.pk.value_to_string(obj), obj.__class__),
+            gfk_key,
+            True,
+            self.field.name,
+            False,
+        )
+
+    async def aget_prefetch_querysets(self, instances, querysets=None):
+        custom_queryset_dict = {}
+        model_by_ct_id = {}
+        if querysets is not None:
+            for queryset in querysets:
+                ct = await self.field.aget_content_type(
+                    model=queryset.query.model, using=queryset.db
+                )
+                if ct.pk in custom_queryset_dict:
+                    raise ValueError(
+                        "Only one queryset is allowed for each content type."
+                    )
+                custom_queryset_dict[ct.pk] = queryset
+                model_by_ct_id[ct.pk] = ct.model_class()
+
+        fk_dict = defaultdict(set)
+        instance_dict = {}
+        ct_attname = self.field.model._meta.get_field(self.field.ct_field).attname
+        for instance in instances:
+            ct_id = getattr(instance, ct_attname)
+            if ct_id is not None:
+                fk_val = getattr(instance, self.field.fk_field)
+                if fk_val is not None:
+                    fk_dict[ct_id].add(fk_val)
+                    instance_dict[ct_id] = instance
+
+        ret_val = []
+        for ct_id, fkeys in fk_dict.items():
+            if ct_id in custom_queryset_dict:
+                queryset = custom_queryset_dict[ct_id].filter(pk__in=fkeys)
+            else:
+                instance = instance_dict[ct_id]
+                ct = await self.field.aget_content_type(
+                    id=ct_id, using=instance._state.db
+                )
+                model_by_ct_id[ct_id] = ct.model_class()
+                queryset = ct.get_all_objects_for_this_type(pk__in=fkeys)
+
+            queryset = queryset.fetch_mode(instances[0]._state.fetch_mode)
+            ret_val.extend([obj async for obj in queryset])
+
+        def gfk_key(obj):
+            ct_id = getattr(obj, ct_attname)
+            if ct_id is None or ct_id not in model_by_ct_id:
+                return None
+            return (
+                str(getattr(obj, self.field.fk_field)),
+                model_by_ct_id[ct_id],
+            )
 
         return (
             ret_val,
@@ -621,20 +693,40 @@ def create_generic_related_manager(superclass, rel):
             self.instance = instance
 
             self.model = rel.model
+            content_type_manager = ContentType.objects.db_manager(instance._state.db)
             self.get_content_type = functools.partial(
-                ContentType.objects.db_manager(instance._state.db).get_for_model,
+                content_type_manager.get_for_model,
                 for_concrete_model=rel.field.for_concrete_model,
             )
-            self.content_type = self.get_content_type(instance)
+            self.aget_content_type = functools.partial(
+                content_type_manager.aget_for_model,
+                for_concrete_model=rel.field.for_concrete_model,
+            )
+            self._content_type = None
             self.content_type_field_name = rel.field.content_type_field_name
             self.object_id_field_name = rel.field.object_id_field_name
             self.prefetch_cache_name = rel.field.attname
             self.pk_val = instance.pk
 
+            opts = content_type_manager._get_opts(
+                instance, rel.field.for_concrete_model
+            )
             self.core_filters = {
-                "%s__pk" % self.content_type_field_name: self.content_type.id,
+                "%s__app_label" % self.content_type_field_name: opts.app_label,
+                "%s__model" % self.content_type_field_name: opts.model_name,
                 self.object_id_field_name: self.pk_val,
             }
+
+        @property
+        def content_type(self):
+            if self._content_type is None:
+                self._content_type = self.get_content_type(self.instance)
+            return self._content_type
+
+        async def _aget_content_type(self):
+            if self._content_type is None:
+                self._content_type = await self.aget_content_type(self.instance)
+            return self._content_type
 
         def __call__(self, *, manager):
             manager = getattr(self.model, manager)
@@ -719,6 +811,64 @@ def create_generic_related_manager(superclass, rel):
                 False,
             )
 
+        async def aget_prefetch_querysets(self, instances, querysets=None):
+            _cloning_disabled = False
+            if querysets:
+                if len(querysets) != 1:
+                    raise ValueError(
+                        "querysets argument of get_prefetch_querysets() should have a "
+                        "length of 1."
+                    )
+                queryset = querysets[0]
+            else:
+                _cloning_disabled = True
+                queryset = super().get_queryset()._disable_cloning()
+            queryset._add_hints(instance=instances[0])
+            queryset = queryset.using(queryset._db or self._db)
+
+            content_types = await ContentType.objects.db_manager(
+                instances[0]._state.db
+            ).aget_for_models(
+                *(obj.__class__ for obj in instances),
+                for_concrete_models=rel.field.for_concrete_model,
+            )
+            content_type_queries = []
+            for model, objs in itertools.groupby(
+                sorted(instances, key=lambda obj: obj.__class__._meta.label_lower),
+                lambda obj: obj.__class__,
+            ):
+                content_type_queries.append(
+                    models.Q.create(
+                        [
+                            (
+                                f"{self.content_type_field_name}__pk",
+                                content_types[model].pk,
+                            ),
+                            (
+                                f"{self.object_id_field_name}__in",
+                                {obj.pk for obj in objs},
+                            ),
+                        ]
+                    )
+                )
+            query = models.Q.create(content_type_queries, connector=models.Q.OR)
+            object_id_converter = instances[0]._meta.pk.to_python
+            content_type_id_field_name = f"{self.content_type_field_name}_id"
+            queryset = queryset.filter(query)
+            if _cloning_disabled:
+                queryset._enable_cloning()
+            return (
+                queryset,
+                lambda relobj: (
+                    object_id_converter(getattr(relobj, self.object_id_field_name)),
+                    getattr(relobj, content_type_id_field_name),
+                ),
+                lambda obj: (obj.pk, content_types[obj.__class__].pk),
+                False,
+                self.prefetch_cache_name,
+                False,
+            )
+
         def add(self, *objs, bulk=True):
             self._remove_prefetched_objects()
             db = router.db_for_write(self.model, instance=self.instance)
@@ -758,7 +908,43 @@ def create_generic_related_manager(superclass, rel):
         add.alters_data = True
 
         async def aadd(self, *objs, bulk=True):
-            return await sync_to_async(self.add)(*objs, bulk=bulk)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.add)(*objs, bulk=bulk)
+
+            self._remove_prefetched_objects()
+            content_type = await self._aget_content_type()
+
+            def check_and_update_obj(obj):
+                if not isinstance(obj, self.model):
+                    raise TypeError(
+                        "'%s' instance expected, got %r"
+                        % (self.model._meta.object_name, obj)
+                    )
+                setattr(obj, self.content_type_field_name, content_type)
+                setattr(obj, self.object_id_field_name, self.pk_val)
+
+            if bulk:
+                pks = []
+                for obj in objs:
+                    if obj._state.adding or obj._state.db != db:
+                        raise ValueError(
+                            "%r instance isn't saved. Use bulk=False or save "
+                            "the object first." % obj
+                        )
+                    check_and_update_obj(obj)
+                    pks.append(obj.pk)
+                await self.model._base_manager.using(db).filter(pk__in=pks).aupdate(
+                    **{
+                        self.content_type_field_name: content_type,
+                        self.object_id_field_name: self.pk_val,
+                    }
+                )
+            else:
+                async with connections[db].atransaction(savepoint=False):
+                    for obj in objs:
+                        check_and_update_obj(obj)
+                        await obj.asave(using=db)
 
         aadd.alters_data = True
 
@@ -770,7 +956,12 @@ def create_generic_related_manager(superclass, rel):
         remove.alters_data = True
 
         async def aremove(self, *objs, bulk=True):
-            return await sync_to_async(self.remove)(*objs, bulk=bulk)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.remove)(*objs, bulk=bulk)
+            if not objs:
+                return
+            await self._aclear(self.filter(pk__in=[o.pk for o in objs]), bulk)
 
         aremove.alters_data = True
 
@@ -780,7 +971,10 @@ def create_generic_related_manager(superclass, rel):
         clear.alters_data = True
 
         async def aclear(self, *, bulk=True):
-            return await sync_to_async(self.clear)(bulk=bulk)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.clear)(bulk=bulk)
+            await self._aclear(self, bulk)
 
         aclear.alters_data = True
 
@@ -798,6 +992,19 @@ def create_generic_related_manager(superclass, rel):
                         obj.delete()
 
         _clear.alters_data = True
+
+        async def _aclear(self, queryset, bulk):
+            self._remove_prefetched_objects()
+            db = router.db_for_write(self.model, instance=self.instance)
+            queryset = queryset.using(db)
+            if bulk:
+                await queryset.adelete()
+            else:
+                async with connections[db].atransaction(savepoint=False):
+                    async for obj in queryset:
+                        await obj.adelete(using=db)
+
+        _aclear.alters_data = True
 
         def set(self, objs, *, bulk=True, clear=False):
             # Force evaluation of `objs` in case it's a queryset whose value
@@ -824,7 +1031,28 @@ def create_generic_related_manager(superclass, rel):
         set.alters_data = True
 
         async def aset(self, objs, *, bulk=True, clear=False):
-            return await sync_to_async(self.set)(objs, bulk=bulk, clear=clear)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.set)(objs, bulk=bulk, clear=clear)
+            if isinstance(objs, QuerySet):
+                objs = tuple([obj async for obj in objs])
+            else:
+                objs = tuple(objs)
+
+            async with connections[db].atransaction(savepoint=False):
+                if clear:
+                    await self.aclear(bulk=bulk)
+                    await self.aadd(*objs, bulk=bulk)
+                else:
+                    old_objs = {obj async for obj in self.using(db).all()}
+                    new_objs = []
+                    for obj in objs:
+                        if obj in old_objs:
+                            old_objs.remove(obj)
+                        else:
+                            new_objs.append(obj)
+                    await self.aremove(*old_objs, bulk=bulk)
+                    await self.aadd(*new_objs, bulk=bulk)
 
         aset.alters_data = True
 
@@ -838,7 +1066,13 @@ def create_generic_related_manager(superclass, rel):
         create.alters_data = True
 
         async def acreate(self, **kwargs):
-            return await sync_to_async(self.create)(**kwargs)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.create)(**kwargs)
+            self._remove_prefetched_objects()
+            kwargs[self.content_type_field_name] = await self._aget_content_type()
+            kwargs[self.object_id_field_name] = self.pk_val
+            return await super().using(db).acreate(**kwargs)
 
         acreate.alters_data = True
 
@@ -851,7 +1085,12 @@ def create_generic_related_manager(superclass, rel):
         get_or_create.alters_data = True
 
         async def aget_or_create(self, **kwargs):
-            return await sync_to_async(self.get_or_create)(**kwargs)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.get_or_create)(**kwargs)
+            kwargs[self.content_type_field_name] = await self._aget_content_type()
+            kwargs[self.object_id_field_name] = self.pk_val
+            return await super().using(db).aget_or_create(**kwargs)
 
         aget_or_create.alters_data = True
 
@@ -864,7 +1103,12 @@ def create_generic_related_manager(superclass, rel):
         update_or_create.alters_data = True
 
         async def aupdate_or_create(self, **kwargs):
-            return await sync_to_async(self.update_or_create)(**kwargs)
+            db = router.db_for_write(self.model, instance=self.instance)
+            if not connections[db].features.supports_async:
+                return await sync_to_async(self.update_or_create)(**kwargs)
+            kwargs[self.content_type_field_name] = await self._aget_content_type()
+            kwargs[self.object_id_field_name] = self.pk_val
+            return await super().using(db).aupdate_or_create(**kwargs)
 
         aupdate_or_create.alters_data = True
 

@@ -3868,7 +3868,9 @@ async def aprefetch_one_level(instances, prefetcher, lookup, level):
     if additional_lookups:
         rel_qs._prefetch_related_lookups = ()
 
-    if hasattr(rel_qs, "db") and connections[rel_qs.db].features.supports_async:
+    if isinstance(rel_qs, list):
+        all_related_objects = rel_qs
+    elif hasattr(rel_qs, "db") and connections[rel_qs.db].features.supports_async:
         all_related_objects = [obj async for obj in rel_qs]
     else:
         all_related_objects = await sync_to_async(list)(rel_qs)

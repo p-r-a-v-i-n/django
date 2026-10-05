@@ -46,6 +46,28 @@ class ContentTypesTests(TestCase):
         with self.assertNumQueries(0):
             ContentType.objects.get_by_natural_key("contenttypes", "contenttype")
 
+    async def test_async_lookup_cache(self):
+        content_type = await ContentType.objects.aget_for_model(ContentType)
+        cached_by_model = await ContentType.objects.aget_for_model(ContentType)
+        cached_by_id = await ContentType.objects.aget_for_id(content_type.pk)
+
+        self.assertIs(cached_by_model, content_type)
+        self.assertIs(cached_by_id, content_type)
+
+    async def test_async_get_for_models(self):
+        content_types = await ContentType.objects.aget_for_models(
+            ContentType,
+            FooWithUrl,
+            ProxyModel,
+            ConcreteModel,
+        )
+
+        self.assertEqual(
+            set(content_types),
+            {ContentType, FooWithUrl, ProxyModel, ConcreteModel},
+        )
+        self.assertEqual(content_types[ProxyModel], content_types[ConcreteModel])
+
     def test_get_for_models_creation(self):
         ContentType.objects.all().delete()
         with self.assertNumQueries(4):
