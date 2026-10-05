@@ -299,6 +299,70 @@ class RawModelIterable(BaseIterable):
             if hasattr(query, "cursor") and query.cursor:
                 query.cursor.close()
 
+    async def _async_native_generator(self):
+        query = self.queryset.query
+        if (
+            type(self).__iter__ is not RawModelIterable.__iter__
+            or type(query) is not sql.RawQuery
+            or query.params_type is dict
+        ):
+            async with aclosing(self._async_generator()) as iterator:
+                async for item in iterator:
+                    yield item
+            return
+
+        db = self.queryset.db
+        connection = connections[db]
+        compiler = connection.ops.compiler("SQLCompiler")(query, connection, db)
+        params = query._convert_params(connection)
+
+        async with connection.acursor() as cursor:
+            await cursor.aexecute(query.sql, params)
+            rows = await cursor.afetchall()
+            if not rows:
+                return
+            converter = connection.introspection.identifier_converter
+            columns = [converter(column[0]) for column in cursor.description]
+
+        for query_name, model_name in self.queryset.translations.items():
+            try:
+                index = columns.index(query_name)
+            except ValueError:
+                pass
+            else:
+                columns[index] = model_name
+        self.queryset.__dict__["columns"] = columns
+
+        model_init_names, model_init_pos, annotation_fields = (
+            self.queryset.resolve_model_init_order()
+        )
+        model_cls = self.queryset.model
+        if any(f.attname not in model_init_names for f in model_cls._meta.pk_fields):
+            raise exceptions.FieldDoesNotExist("Raw query must include the primary key")
+        fields = [self.queryset.model_fields.get(column) for column in columns]
+        cols = [
+            field.get_col(field.model._meta.db_table) if field else None
+            for field in fields
+        ]
+        converters = compiler.get_converters(cols)
+        if converters:
+            rows = compiler.apply_converters(rows, converters)
+        if compiler.has_composite_fields(cols):
+            rows = compiler.composite_fields_to_tuples(rows, cols)
+
+        fetch_mode = self.queryset._fetch_mode
+        from_db = _get_from_db(model_cls, fetch_mode)
+        peers = []
+        for values in rows:
+            model_init_values = [values[pos] for pos in model_init_pos]
+            instance = from_db(db, model_init_names, model_init_values)
+            if fetch_mode.track_peers:
+                peers.append(weak_ref(instance))
+                instance._state.peers = peers
+            for column, pos in annotation_fields:
+                setattr(instance, column, values[pos])
+            yield instance
+
 
 class ValuesIterable(BaseIterable):
     """
@@ -3157,6 +3221,15 @@ class RawQuerySet:
         if self._prefetch_related_lookups and not self._prefetch_done:
             self._prefetch_related_objects()
 
+    async def _afetch_all(self):
+        if self._result_cache is None:
+            self._result_cache = [item async for item in RawModelIterable(self)]
+        if self._prefetch_related_lookups and not self._prefetch_done:
+            await aprefetch_related_objects(
+                self._result_cache, *self._prefetch_related_lookups
+            )
+            self._prefetch_done = True
+
     def __len__(self):
         self._fetch_all()
         return len(self._result_cache)
@@ -3173,7 +3246,10 @@ class RawQuerySet:
         # Remember, __aiter__ itself is synchronous, it's the thing it returns
         # that is async!
         async def generator():
-            await sync_to_async(self._fetch_all)()
+            if connections[self.db].features.supports_async:
+                await self._afetch_all()
+            else:
+                await sync_to_async(self._fetch_all)()
             for item in self._result_cache:
                 yield item
 

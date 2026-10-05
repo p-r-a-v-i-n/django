@@ -208,9 +208,7 @@ class RawQuery:
             return self.sql
         return self.sql % self.params_type(self.params)
 
-    def _execute_query(self):
-        connection = connections[self.using]
-
+    def _convert_params(self, connection):
         # Adapt parameters to the database, as much as possible considering
         # that the target type isn't known. See #17755.
         params_type = self.params_type
@@ -223,6 +221,11 @@ class RawQuery:
             params = None
         else:
             raise RuntimeError("Unexpected params type: %s" % params_type)
+        return params
+
+    def _execute_query(self):
+        connection = connections[self.using]
+        params = self._convert_params(connection)
 
         self.cursor = connection.cursor()
         self.cursor.execute(self.sql, params)
