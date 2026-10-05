@@ -27,6 +27,7 @@ from django.core.cache import caches
 from django.core.cache.backends.base import InvalidCacheBackendError
 from django.core.exceptions import ImproperlyConfigured
 from django.core.signing import TimestampSigner
+from django.db import connection
 from django.http import HttpResponse
 from django.test import (
     RequestFactory,
@@ -677,6 +678,38 @@ class DatabaseSessionTests(SessionTestsMixin, TestCase):
         s = self.model.objects.get(session_key=session_key)
 
         self.assertEqual(str(s), session_key)
+
+    async def test_asave_uses_native_async_transaction(self):
+        await self.session.aset("key", "value")
+        self.session._session_key = "session-key"
+        obj = self.model()
+        obj.asave = mock.AsyncMock()
+        atomic_context = mock.MagicMock()
+        atomic_context.__aenter__ = mock.AsyncMock()
+        atomic_context.__aexit__ = mock.AsyncMock(return_value=False)
+
+        with (
+            mock.patch.object(connection.features, "supports_async", True),
+            mock.patch.object(
+                self.session,
+                "acreate_model_instance",
+                new=mock.AsyncMock(return_value=obj),
+            ),
+            mock.patch(
+                "django.contrib.sessions.backends.db.transaction.atomic",
+                return_value=atomic_context,
+            ) as atomic,
+        ):
+            await self.session.asave(must_create=True)
+
+        atomic.assert_called_once_with(using="default")
+        atomic_context.__aenter__.assert_awaited_once_with()
+        atomic_context.__aexit__.assert_awaited_once_with(None, None, None)
+        obj.asave.assert_awaited_once_with(
+            force_insert=True,
+            force_update=False,
+            using="default",
+        )
 
     def test_session_get_decoded(self):
         """
