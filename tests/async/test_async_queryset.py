@@ -146,6 +146,49 @@ class AsyncQuerySetTest(TestCase):
             [mock.call(2), mock.call(2), mock.call(2)],
         )
 
+    async def test_native_prefetch_related(self):
+        cursor = mock.MagicMock()
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchall = mock.AsyncMock(
+            side_effect=[
+                [(self.s1.pk,), (self.s2.pk,), (self.s3.pk,)],
+                [
+                    (self.r1.pk, self.s1.pk),
+                    (self.r2.pk, self.s2.pk),
+                    (self.r3.pk, self.s3.pk),
+                ],
+            ]
+        )
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with (
+            mock.patch.object(connection.features, "supports_async", True),
+            mock.patch.object(
+                connection,
+                "acursor",
+                return_value=async_cursor,
+                create=True,
+            ) as acursor,
+        ):
+            instances = [
+                instance
+                async for instance in SimpleModel.objects.only("pk")
+                .order_by("pk")
+                .prefetch_related("relatedmodel_set")
+            ]
+            related_objects = [
+                related
+                for instance in instances
+                for related in instance.relatedmodel_set.all()
+            ]
+
+        self.assertEqual(instances, [self.s1, self.s2, self.s3])
+        self.assertEqual(related_objects, [self.r1, self.r2, self.r3])
+        self.assertIs(related_objects[0].simple, instances[0])
+        self.assertEqual(acursor.call_count, 2)
+        self.assertEqual(cursor.afetchall.await_count, 2)
+
     async def test_native_aiterator_closes_partially_consumed_results(self):
         cursor = mock.MagicMock()
         cursor.aexecute = mock.AsyncMock()
