@@ -754,6 +754,13 @@ class Model(AltersData, metaclass=ModelBase):
         When fetching deferred fields for a single instance (the FETCH_ONE
         fetch mode), the deferred loading uses this method.
         """
+        setup = self._refresh_from_db_query(using, fields, from_queryset)
+        if setup is None:
+            return
+        db_instance_qs, fields = setup
+        self._set_refreshed_fields(db_instance_qs.get(), fields)
+
+    def _refresh_from_db_query(self, using, fields, from_queryset):
         if fields is None:
             self._prefetched_objects_cache = {}
         else:
@@ -764,7 +771,7 @@ class Model(AltersData, metaclass=ModelBase):
                     del prefetched_objects_cache[field]
                     fields.remove(field)
             if not fields:
-                return
+                return None
             if any(LOOKUP_SEP in f for f in fields):
                 raise ValueError(
                     'Found "%s" in fields argument. Relations and transforms '
@@ -792,7 +799,9 @@ class Model(AltersData, metaclass=ModelBase):
                 }
             )
 
-        db_instance = db_instance_qs.get()
+        return db_instance_qs, fields
+
+    def _set_refreshed_fields(self, db_instance, fields):
         non_loaded_fields = db_instance.get_deferred_fields()
         for field in self._meta.fields:
             if field.attname in non_loaded_fields:
@@ -824,6 +833,22 @@ class Model(AltersData, metaclass=ModelBase):
         self._state.db = db_instance._state.db
 
     async def arefresh_from_db(self, using=None, fields=None, from_queryset=None):
+        database = using
+        if database is None:
+            if from_queryset is not None:
+                database = from_queryset.db
+            else:
+                database = router.db_for_read(self.__class__, instance=self)
+        if (
+            type(self).refresh_from_db is Model.refresh_from_db
+            and connections[database].features.supports_async
+        ):
+            setup = self._refresh_from_db_query(using, fields, from_queryset)
+            if setup is None:
+                return
+            db_instance_qs, fields = setup
+            self._set_refreshed_fields(await db_instance_qs.aget(), fields)
+            return
         return await sync_to_async(self.refresh_from_db)(
             using=using, fields=fields, from_queryset=from_queryset
         )
