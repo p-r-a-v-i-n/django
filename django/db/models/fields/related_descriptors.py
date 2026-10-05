@@ -884,6 +884,41 @@ def create_reverse_many_to_one_manager(superclass, rel):
         add.alters_data = True
 
         async def aadd(self, *objs, bulk=True):
+            db = router.db_for_write(self.model, instance=self.instance)
+            if connections[db].features.supports_async:
+                self._check_fk_val()
+                self._remove_prefetched_objects()
+
+                def check_and_update_obj(obj):
+                    if not isinstance(obj, self.model):
+                        raise TypeError(
+                            "'%s' instance expected, got %r"
+                            % (
+                                self.model._meta.object_name,
+                                obj,
+                            )
+                        )
+                    setattr(obj, self.field.name, self.instance)
+
+                if bulk:
+                    pks = []
+                    for obj in objs:
+                        check_and_update_obj(obj)
+                        if obj._state.adding or obj._state.db != db:
+                            raise ValueError(
+                                "%r instance isn't saved. Use bulk=False or save "
+                                "the object first." % obj
+                            )
+                        pks.append(obj.pk)
+                    await self.model._base_manager.using(db).filter(pk__in=pks).aupdate(
+                        **{self.field.name: self.instance}
+                    )
+                else:
+                    async with connections[db].atransaction():
+                        for obj in objs:
+                            check_and_update_obj(obj)
+                            await obj.asave()
+                return
             return await sync_to_async(self.add)(*objs, bulk=bulk)
 
         aadd.alters_data = True
@@ -898,6 +933,14 @@ def create_reverse_many_to_one_manager(superclass, rel):
         create.alters_data = True
 
         async def acreate(self, **kwargs):
+            db = router.db_for_write(self.model, instance=self.instance)
+            if connections[db].features.supports_async:
+                self._check_fk_val()
+                self._remove_prefetched_objects()
+                kwargs[self.field.name] = self.instance
+                return await super(RelatedManager, self.db_manager(db)).acreate(
+                    **kwargs
+                )
             return await sync_to_async(self.create)(**kwargs)
 
         acreate.alters_data = True
@@ -911,6 +954,13 @@ def create_reverse_many_to_one_manager(superclass, rel):
         get_or_create.alters_data = True
 
         async def aget_or_create(self, **kwargs):
+            db = router.db_for_write(self.model, instance=self.instance)
+            if connections[db].features.supports_async:
+                self._check_fk_val()
+                kwargs[self.field.name] = self.instance
+                return await super(RelatedManager, self.db_manager(db)).aget_or_create(
+                    **kwargs
+                )
             return await sync_to_async(self.get_or_create)(**kwargs)
 
         aget_or_create.alters_data = True
@@ -924,6 +974,13 @@ def create_reverse_many_to_one_manager(superclass, rel):
         update_or_create.alters_data = True
 
         async def aupdate_or_create(self, **kwargs):
+            db = router.db_for_write(self.model, instance=self.instance)
+            if connections[db].features.supports_async:
+                self._check_fk_val()
+                kwargs[self.field.name] = self.instance
+                return await super(
+                    RelatedManager, self.db_manager(db)
+                ).aupdate_or_create(**kwargs)
             return await sync_to_async(self.update_or_create)(**kwargs)
 
         aupdate_or_create.alters_data = True
@@ -959,6 +1016,30 @@ def create_reverse_many_to_one_manager(superclass, rel):
             remove.alters_data = True
 
             async def aremove(self, *objs, bulk=True):
+                db = router.db_for_write(self.model, instance=self.instance)
+                if connections[db].features.supports_async:
+                    if not objs:
+                        return
+                    self._check_fk_val()
+                    val = self.field.get_foreign_related_value(self.instance)
+                    old_ids = set()
+                    for obj in objs:
+                        if not isinstance(obj, self.model):
+                            raise TypeError(
+                                "'%s' instance expected, got %r"
+                                % (
+                                    self.model._meta.object_name,
+                                    obj,
+                                )
+                            )
+                        if self.field.get_local_related_value(obj) == val:
+                            old_ids.add(obj.pk)
+                        else:
+                            raise self.field.remote_field.model.DoesNotExist(
+                                "%r is not related to %r." % (obj, self.instance)
+                            )
+                    await self._aclear(self.filter(pk__in=old_ids), bulk)
+                    return
                 return await sync_to_async(self.remove)(*objs, bulk=bulk)
 
             aremove.alters_data = True
@@ -970,6 +1051,11 @@ def create_reverse_many_to_one_manager(superclass, rel):
             clear.alters_data = True
 
             async def aclear(self, *, bulk=True):
+                db = router.db_for_write(self.model, instance=self.instance)
+                if connections[db].features.supports_async:
+                    self._check_fk_val()
+                    await self._aclear(self, bulk)
+                    return
                 return await sync_to_async(self.clear)(bulk=bulk)
 
             aclear.alters_data = True
@@ -988,6 +1074,20 @@ def create_reverse_many_to_one_manager(superclass, rel):
                             obj.save(update_fields=[self.field.name])
 
             _clear.alters_data = True
+
+            async def _aclear(self, queryset, bulk):
+                self._remove_prefetched_objects()
+                db = router.db_for_write(self.model, instance=self.instance)
+                queryset = queryset.using(db)
+                if bulk:
+                    await queryset.aupdate(**{self.field.name: None})
+                else:
+                    async with connections[db].atransaction():
+                        async for obj in queryset:
+                            setattr(obj, self.field.name, None)
+                            await obj.asave(update_fields=[self.field.name])
+
+            _aclear.alters_data = True
 
         def set(self, objs, *, bulk=True, clear=False):
             self._check_fk_val()
@@ -1018,6 +1118,33 @@ def create_reverse_many_to_one_manager(superclass, rel):
         set.alters_data = True
 
         async def aset(self, objs, *, bulk=True, clear=False):
+            db = router.db_for_write(self.model, instance=self.instance)
+            if connections[db].features.supports_async:
+                self._check_fk_val()
+                if isinstance(objs, QuerySet):
+                    objs = tuple([obj async for obj in objs])
+                else:
+                    objs = tuple(objs)
+
+                if self.field.null:
+                    async with connections[db].atransaction():
+                        if clear:
+                            await self.aclear(bulk=bulk)
+                            await self.aadd(*objs, bulk=bulk)
+                        else:
+                            old_objs = {obj async for obj in self.using(db).all()}
+                            new_objs = []
+                            for obj in objs:
+                                if obj in old_objs:
+                                    old_objs.remove(obj)
+                                else:
+                                    new_objs.append(obj)
+
+                            await self.aremove(*old_objs, bulk=bulk)
+                            await self.aadd(*new_objs, bulk=bulk)
+                else:
+                    await self.aadd(*objs, bulk=bulk)
+                return
             return await sync_to_async(self.set)(objs=objs, bulk=bulk, clear=clear)
 
         aset.alters_data = True
