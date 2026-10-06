@@ -566,3 +566,32 @@ class AsyncQuerySetTest(TestCase):
         acursor.assert_called_once_with()
         cursor.aexecute.assert_awaited_once_with(sql, (1,))
         cursor.afetchall.assert_awaited_once_with()
+
+    async def test_native_raw_with_named_parameters(self):
+        sql = "SELECT id, field FROM async_simplemodel WHERE field=%(field)s"
+        params = {"field": 1}
+        cursor = mock.MagicMock()
+        cursor.description = [
+            ("id", None, None, None, None, None, None),
+            ("field", None, None, None, None, None, None),
+        ]
+        cursor.aexecute = mock.AsyncMock()
+        cursor.afetchall = mock.AsyncMock(return_value=[(self.s1.pk, self.s1.field)])
+        async_cursor = mock.MagicMock()
+        async_cursor.__aenter__.return_value = cursor
+
+        with (
+            mock.patch.object(connection.features, "supports_async", True),
+            mock.patch.object(
+                connection,
+                "acursor",
+                return_value=async_cursor,
+                create=True,
+            ) as acursor,
+        ):
+            results = [obj async for obj in SimpleModel.objects.raw(sql, params)]
+
+        self.assertEqual(results, [self.s1])
+        acursor.assert_called_once_with()
+        cursor.aexecute.assert_awaited_once_with(sql, params)
+        cursor.afetchall.assert_awaited_once_with()

@@ -304,7 +304,6 @@ class RawModelIterable(BaseIterable):
         if (
             type(self).__iter__ is not RawModelIterable.__iter__
             or type(query) is not sql.RawQuery
-            or query.params_type is dict
         ):
             async with aclosing(self._async_generator()) as iterator:
                 async for item in iterator:
