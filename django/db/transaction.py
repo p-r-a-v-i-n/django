@@ -1,4 +1,5 @@
 import warnings
+from asyncio import get_running_loop
 from contextlib import ContextDecorator, contextmanager
 from contextvars import ContextVar
 from functools import wraps
@@ -16,6 +17,18 @@ from django.utils.deprecation import RemovedInDjango2028Warning
 from django.utils.warnings import django_file_prefixes
 
 _async_atomic_blocks = ContextVar("django_async_atomic_blocks", default={})
+
+
+def _uses_async_transaction(connection):
+    if _async_atomic_blocks.get().get(connection.alias):
+        return True
+    if not connection.features.supports_async or connection.in_atomic_block:
+        return False
+    try:
+        get_running_loop()
+    except RuntimeError:
+        return False
+    return True
 
 
 class TransactionManagementError(ProgrammingError):
@@ -97,7 +110,10 @@ def clean_savepoints(using=None):
 
 def get_rollback(using=None):
     """Get the "needs rollback" flag -- for *advanced use* only."""
-    return get_connection(using).get_rollback()
+    connection = get_connection(using)
+    if _uses_async_transaction(connection):
+        return connection.get_async_rollback()
+    return connection.get_rollback()
 
 
 def set_rollback(rollback, using=None):
@@ -112,7 +128,10 @@ def set_rollback(rollback, using=None):
     rolling back to a known-good state! Otherwise, you break the atomic block
     and data corruption may occur.
     """
-    return get_connection(using).set_rollback(rollback)
+    connection = get_connection(using)
+    if _uses_async_transaction(connection):
+        return connection.set_async_rollback(rollback)
+    return connection.set_rollback(rollback)
 
 
 @contextmanager
@@ -149,7 +168,10 @@ def on_commit(func, using=None, robust=False):
     Register `func` to be called when the current transaction is committed.
     If the current transaction is rolled back, `func` will not be called.
     """
-    get_connection(using).on_commit(func, robust)
+    connection = get_connection(using)
+    if _uses_async_transaction(connection):
+        return connection.on_async_commit(func, robust)
+    return connection.on_commit(func, robust)
 
 
 #################################
@@ -401,11 +423,18 @@ class Atomic(ContextDecorator):
             raise RuntimeError("Async atomic block is not active.")
 
         context, blocks_token = contexts[-1]
+        connection = get_connection(self.using)
+        blocks = _async_atomic_blocks.get().get(connection.alias, ())
+        completed = False
         try:
-            return await context.__aexit__(exc_type, exc_value, traceback)
+            result = await context.__aexit__(exc_type, exc_value, traceback)
+            completed = True
         finally:
             self._async_contexts.set(contexts[:-1])
             _async_atomic_blocks.reset(blocks_token)
+        if completed and len(blocks) == 1:
+            connection.run_async_commit_hooks()
+        return result
 
 
 def atomic(

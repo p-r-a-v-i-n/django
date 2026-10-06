@@ -340,6 +340,24 @@ class BaseDatabaseWrapper:
         """Return whether native async queries are outside a transaction."""
         return True
 
+    def get_async_rollback(self):
+        raise NotSupportedError(
+            "This database backend does not support native async transactions."
+        )
+
+    def set_async_rollback(self, rollback):
+        raise NotSupportedError(
+            "This database backend does not support native async transactions."
+        )
+
+    def on_async_commit(self, func, robust=False):
+        raise NotSupportedError(
+            "This database backend does not support native async transactions."
+        )
+
+    def run_async_commit_hooks(self):
+        pass
+
     @async_unsafe
     def commit(self):
         """Commit a transaction and reset the dirty flag."""
