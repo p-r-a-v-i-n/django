@@ -49,7 +49,10 @@ def get_connection(using=None):
 
 def get_autocommit(using=None):
     """Get the autocommit status of the connection."""
-    return get_connection(using).get_autocommit()
+    connection = get_connection(using)
+    if _uses_async_transaction(connection):
+        return connection.get_async_autocommit()
+    return connection.get_autocommit()
 
 
 def set_autocommit(autocommit, using=None):

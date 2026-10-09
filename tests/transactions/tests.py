@@ -745,6 +745,9 @@ class AsyncAtomicTests(SimpleTestCase):
             mock.patch.object(db_connection.features, "supports_async", True),
             mock.patch.object(db_connection, "atransaction", return_value=context),
             mock.patch.object(
+                db_connection, "get_async_autocommit", return_value=False
+            ) as get_async_autocommit,
+            mock.patch.object(
                 db_connection, "get_async_rollback", return_value=True
             ) as get_async_rollback,
             mock.patch.object(
@@ -753,10 +756,12 @@ class AsyncAtomicTests(SimpleTestCase):
             mock.patch.object(db_connection, "on_async_commit") as on_async_commit,
         ):
             async with transaction.atomic():
+                self.assertIs(transaction.get_autocommit(), False)
                 self.assertIs(transaction.get_rollback(), True)
                 transaction.set_rollback(False)
                 transaction.on_commit(callback, robust=True)
 
+        get_async_autocommit.assert_called_once_with()
         get_async_rollback.assert_called_once_with()
         set_async_rollback.assert_called_once_with(False)
         on_async_commit.assert_called_once_with(callback, True)
